@@ -98,6 +98,30 @@ bool GameReceivesPointerAt(UIView *view, const Rect &bounds, Point point) {
     return target == view || [target isDescendantOfView:view];
 }
 
+char gameLockPreference;
+char gameLockHook;
+
+void SetGamePointerLock(UIViewController *controller, bool locked) {
+    if (!controller) return;
+    NSNumber *current = objc_getAssociatedObject(controller, &gameLockPreference);
+    if (current.boolValue == locked) return;
+    const SEL selector = @selector(prefersPointerLocked);
+    Class type = object_getClass(controller);
+    if (!objc_getAssociatedObject(type, &gameLockHook)) {
+        Method method = class_getInstanceMethod(type, selector);
+        if (!method) return;
+        auto original = reinterpret_cast<BOOL (*)(UIViewController *, SEL)>(method_getImplementation(method));
+        IMP requested = imp_implementationWithBlock(^BOOL(UIViewController *root) {
+            NSNumber *setting = objc_getAssociatedObject(root, &gameLockPreference);
+            return setting ? setting.boolValue : original(root, selector);
+        });
+        class_replaceMethod(type, selector, requested, method_getTypeEncoding(method));
+        objc_setAssociatedObject(type, &gameLockHook, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    objc_setAssociatedObject(controller, &gameLockPreference, @(locked), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [controller setNeedsUpdateOfPrefersPointerLocked];
+}
+
 using SetCursor = void (*)(id, SEL);
 SetCursor originalSetCursor;
 bool ownsVisibleArrow;
@@ -191,12 +215,13 @@ NSURL *SRDMApplicationSupport(void) {
 
 @interface SRDMPlayCoverHost : NSObject
 - (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide;
-- (void)frame;
+- (void)frame:(CADisplayLink *)displayLink;
 @end
 
 @implementation SRDMPlayCoverHost {
     starrail::PointerTransition _pointer;
     __weak UIView *_lastView;
+    __weak UIViewController *_lockController;
     double _gain;
     bool _diagnosticsOnly;
     bool _diagnosticsEnabled;
@@ -204,6 +229,7 @@ NSURL *SRDMApplicationSupport(void) {
     bool _loggedMouseRoute;
     bool _loggedHostContext;
     bool _playToolsCursorHidden;
+    bool _desktopLayout;
 }
 
 - (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide {
@@ -216,7 +242,6 @@ NSURL *SRDMApplicationSupport(void) {
     _diagnosticsEnabled = _diagnosticsOnly || hasMarker(@"diagnostics");
     if (_diagnosticsEnabled) SRDMStartDiagnostics();
 
-    bool desktopLayout = false;
     if (!_diagnosticsOnly) {
         NSURL *legacy = [[NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:@"UserPlugins"]
                          URLByAppendingPathComponent:@"libUnityDesktopMode.dylib"];
@@ -224,7 +249,14 @@ NSURL *SRDMApplicationSupport(void) {
             NSLog(@"[StarRailDesktopMode] remove the legacy desktop-mode plugin before enabling input");
             return;
         }
-        desktopLayout = SRDMEnableDesktopLayout(*header, slide);
+        _desktopLayout = SRDMEnableDesktopLayout(*header, slide);
+    }
+    if (_desktopLayout) {
+        // Unity fills its native delegate table during player initialization.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            const bool enabled = SRDMEnableDesktopCursor(*header, slide);
+            NSLog(@"[StarRailDesktopMode] game cursor lifecycle=%d", enabled);
+        });
         _gain = CameraGain();
         SRDMInstallMouseSampling();
         customCursor = LoadCursor();
@@ -241,17 +273,21 @@ NSURL *SRDMApplicationSupport(void) {
                       name:@"playtools.cursorWillShow" object:nil];
         [center addObserver:self selector:@selector(lostFocus:)
                       name:UIApplicationWillResignActiveNotification object:nil];
+        [center addObserver:self selector:@selector(lostFocus:)
+                      name:@"NSApplicationWillResignActiveNotification" object:nil];
     }
-    CADisplayLink *displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame)];
+    CADisplayLink *displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     displayLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
     [displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     NSLog(@"[StarRailDesktopMode] host ready client=CN-4.7.0 diagnostic_only=%d desktop_layout=%d custom_arrow=%d",
-          _diagnosticsOnly, desktopLayout, customCursor != nil);
+          _diagnosticsOnly, _desktopLayout, customCursor != nil);
 }
 
 - (void)lostFocus:(NSNotification *)notification {
     (void)notification;
     _pointer.update(false, true);
+    SetGamePointerLock(_lockController, false);
+    _lockController = nil;
     SRDMFlushMouse(false, _gain, nil);
     RefreshCursor(false);
 }
@@ -291,8 +327,17 @@ NSURL *SRDMApplicationSupport(void) {
 
     static auto cursorVisible = reinterpret_cast<boolean_t (*)()>(dlsym(RTLD_DEFAULT, "CGCursorIsVisible"));
     static auto warp = reinterpret_cast<CGError (*)(CGPoint)>(dlsym(RTLD_DEFAULT, "CGWarpMouseCursorPosition"));
+    UIViewController *controller = gameOwns ? view.window.rootViewController : nil;
+    if (_lockController != controller) {
+        SetGamePointerLock(_lockController, false);
+        _lockController = controller;
+    }
+    const auto requested = SRDMRequestedCursor();
+    const bool needsLock = requested.known && !requested.visible && requested.locked && !_playToolsCursorHidden;
+    SetGamePointerLock(_lockController, needsLock);
     const bool locked = view.window.windowScene.pointerLockState.isLocked;
-    const bool visible = !locked && !_playToolsCursorHidden && (!cursorVisible || cursorVisible() != 0);
+    const bool systemVisible = !cursorVisible || cursorVisible() != 0;
+    const bool visible = !locked && !_playToolsCursorHidden && systemVisible && (!requested.known || requested.visible);
     const CGPoint mousePosition = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
     starrail::Point mouse{mousePosition.x, primaryTop - mousePosition.y};
 
@@ -301,15 +346,19 @@ NSURL *SRDMApplicationSupport(void) {
         _lastView = view;
     }
     const bool pointerInside = gameOwns && GameReceivesPointerAt(view, viewport, mouse);
-    const bool shouldCenter = _pointer.update(gameOwns && (visible || locked || _playToolsCursorHidden || pointerInside), visible);
+    const bool shouldCenter = _pointer.update(gameOwns && (visible || needsLock || locked || _playToolsCursorHidden || pointerInside), visible);
     if (shouldCenter && warp) {
         const auto spot = viewport.center();
         if (warp(CGPointMake(spot.x, spot.y)) == kCGErrorSuccess) {
             mouse = spot;
-            if (_diagnosticsEnabled) NSLog(@"[StarRailDesktopMode] pointer centered");
+            if (_diagnosticsEnabled) {
+                const CGPoint actual = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
+                NSLog(@"[StarRailDesktopMode] pointer centered error=(%.2f,%.2f) pt",
+                      actual.x - spot.x, primaryTop - actual.y - spot.y);
+            }
         }
     }
-    SRDMFlushMouse(gameOwns && !_playToolsCursorHidden && (locked || (!visible && pointerInside)),
+    SRDMFlushMouse(gameOwns && !_playToolsCursorHidden && (needsLock || locked || (!visible && pointerInside)),
                    _gain, (CAMetalLayer *)view.layer);
     RefreshCursor(gameOwns && visible && GameReceivesPointerAt(view, viewport, mouse));
 
@@ -319,8 +368,9 @@ NSURL *SRDMApplicationSupport(void) {
     }
 }
 
-- (void)frame {
-    if (!_diagnosticsOnly) [self updatePointer];
+- (void)frame:(CADisplayLink *)displayLink {
+    (void)displayLink;
+    if (_desktopLayout) [self updatePointer];
     if (!_diagnosticsEnabled) return;
     SRDMSampleGraphics((CAMetalLayer *)ForegroundMetalView().layer);
     if (!_loggedMouseRoute && SRDMHasGameMouseHandler()) {

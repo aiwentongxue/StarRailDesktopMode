@@ -1,6 +1,7 @@
 #import "Runtime.hpp"
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -23,8 +24,39 @@ constexpr std::array LayoutChecks{
     LayoutCheck{0x0253eb60, 0x97af3c6b, 0x360000a0},
 };
 constexpr uint32_t TrueInResultRegister = 0x52800020; // mov w0, #1
+constexpr uint32_t FalseInResultRegister = 0x52800000; // mov w0, #0
 
-const section_64 *FindCodeSection(const mach_header_64 &header) {
+// These call sites skip the game cursor lifecycle on mobile. Keep the
+// keyboard/mouse and controller checks after each predicate intact.
+constexpr std::array CursorChecks{
+    LayoutCheck{0x01d91ec4, 0x97cdef6a, 0x37000180},
+    LayoutCheck{0x01d91fc4, 0x97cdef2a, 0x37000240},
+    LayoutCheck{0x01d92164, 0x97cdeec2, 0x37000160},
+    LayoutCheck{0x01d92204, 0x97cdee9a, 0x370004e0},
+    LayoutCheck{0x01d924c0, 0x97cdedeb, 0x36000060},
+};
+
+// The managed Cursor methods dispatch through Unity's writable delegate table.
+constexpr uintptr_t UnityCursorTable = 0x1656f118;
+constexpr uintptr_t CursorVisibilityDelegate = 0x107c02e4;
+constexpr uintptr_t CursorLockDelegate = 0x107c032c;
+using CursorSetter = void (*)(int);
+CursorSetter originalCursorVisibility;
+CursorSetter originalCursorLock;
+std::atomic<int> cursorVisibility{-1};
+std::atomic<int> cursorLockMode{0};
+
+void ObserveCursorVisibility(int value) {
+    originalCursorVisibility(value);
+    cursorVisibility.store(value != 0);
+}
+
+void ObserveCursorLock(int mode) {
+    originalCursorLock(mode);
+    cursorLockMode.store(mode);
+}
+
+const section_64 *FindSection(const mach_header_64 &header, const char *segmentName, const char *sectionName) {
     const auto *cursor = reinterpret_cast<const uint8_t *>(&header + 1);
     uint32_t remaining = header.sizeofcmds;
     for (uint32_t i = 0; i < header.ncmds; ++i) {
@@ -33,12 +65,12 @@ const section_64 *FindCodeSection(const mach_header_64 &header) {
         if (command->cmdsize < sizeof(load_command) || command->cmdsize > remaining) return nullptr;
         if (command->cmd == LC_SEGMENT_64 && command->cmdsize >= sizeof(segment_command_64)) {
             const auto *segment = reinterpret_cast<const segment_command_64 *>(command);
-            if (std::strncmp(segment->segname, "__TEXT", sizeof(segment->segname)) == 0) {
+            if (std::strncmp(segment->segname, segmentName, sizeof(segment->segname)) == 0) {
                 const auto *sections = reinterpret_cast<const section_64 *>(segment + 1);
                 const auto count = (command->cmdsize - sizeof(*segment)) / sizeof(*sections);
                 if (segment->nsects > count) return nullptr;
                 for (uint32_t section = 0; section < segment->nsects; ++section) {
-                    if (std::strncmp(sections[section].sectname, "__text", sizeof(sections[section].sectname)) == 0) {
+                    if (std::strncmp(sections[section].sectname, sectionName, sizeof(sections[section].sectname)) == 0) {
                         return &sections[section];
                     }
                 }
@@ -72,35 +104,61 @@ kern_return_t ReplaceCall(uint32_t *word, uint32_t expected, uint32_t replacemen
     return status;
 }
 
-} // namespace
-
-bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide) {
-    const auto *code = FindCodeSection(verifiedImage);
+template<size_t Count>
+bool ApplyChecks(const mach_header_64 &verifiedImage, intptr_t slide,
+                 const std::array<LayoutCheck, Count> &checks, uint32_t replacement) {
+    const auto *code = FindSection(verifiedImage, "__TEXT", "__text");
     if (!code || code->size < 2 * sizeof(uint32_t)) return false;
-    std::array<uint32_t *, LayoutChecks.size()> words{};
-    for (size_t i = 0; i < LayoutChecks.size(); ++i) {
-        const auto &check = LayoutChecks[i];
+    std::array<uint32_t *, Count> words{};
+    for (size_t i = 0; i < Count; ++i) {
+        const auto &check = checks[i];
         if (check.address < code->addr || check.address - code->addr > code->size - 2 * sizeof(uint32_t)) return false;
         auto *word = reinterpret_cast<uint32_t *>(slide + check.address);
         if (word[0] != check.call || word[1] != check.branch) {
-            NSLog(@"[StarRailDesktopMode] desktop layout check did not match at 0x%x", check.address);
+            NSLog(@"[StarRailDesktopMode] Unity input check did not match at 0x%x", check.address);
             return false;
         }
         words[i] = word;
     }
 
     for (size_t i = 0; i < words.size(); ++i) {
-        const auto status = ReplaceCall(words[i], LayoutChecks[i].call, TrueInResultRegister);
+        const auto status = ReplaceCall(words[i], checks[i].call, replacement);
         if (status == KERN_SUCCESS) continue;
-        NSLog(@"[StarRailDesktopMode] desktop layout change failed at 0x%x, status=%d",
-              LayoutChecks[i].address, status);
+        NSLog(@"[StarRailDesktopMode] Unity input change failed at 0x%x, status=%d",
+              checks[i].address, status);
         for (size_t previous = i; previous > 0; --previous) {
             const auto index = previous - 1;
-            if (ReplaceCall(words[index], TrueInResultRegister, LayoutChecks[index].call) != KERN_SUCCESS) {
-                NSLog(@"[StarRailDesktopMode] could not restore desktop layout call at 0x%x", LayoutChecks[index].address);
+            if (ReplaceCall(words[index], replacement, checks[index].call) != KERN_SUCCESS) {
+                NSLog(@"[StarRailDesktopMode] could not restore Unity input call at 0x%x", checks[index].address);
             }
         }
         return false;
     }
     return true;
+}
+
+} // namespace
+
+bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide) {
+    return ApplyChecks(verifiedImage, slide, LayoutChecks, TrueInResultRegister);
+}
+
+bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide) {
+    const auto *data = FindSection(verifiedImage, "__DATA", "__common");
+    constexpr size_t tableSize = 4 * sizeof(uintptr_t);
+    if (!data || data->size < tableSize || UnityCursorTable < data->addr ||
+        UnityCursorTable - data->addr > data->size - tableSize) return false;
+    auto *slots = reinterpret_cast<uintptr_t *>(slide + UnityCursorTable);
+    if (slots[1] != slide + CursorVisibilityDelegate || slots[3] != slide + CursorLockDelegate) return false;
+    if (!ApplyChecks(verifiedImage, slide, CursorChecks, FalseInResultRegister)) return false;
+    originalCursorVisibility = reinterpret_cast<CursorSetter>(slots[1]);
+    originalCursorLock = reinterpret_cast<CursorSetter>(slots[3]);
+    __atomic_store_n(slots + 1, reinterpret_cast<uintptr_t>(ObserveCursorVisibility), __ATOMIC_RELEASE);
+    __atomic_store_n(slots + 3, reinterpret_cast<uintptr_t>(ObserveCursorLock), __ATOMIC_RELEASE);
+    return true;
+}
+
+SRDMUnityCursorState SRDMRequestedCursor() {
+    const int visible = cursorVisibility.load();
+    return {visible >= 0, visible != 0, cursorLockMode.load() == 1};
 }
