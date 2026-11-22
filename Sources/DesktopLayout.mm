@@ -48,15 +48,25 @@ std::atomic<int> cursorLockMode{0};
 
 void ObserveCursorVisibility(int value) {
     originalCursorVisibility(value);
-    cursorVisibility.store(value != 0);
+    if (cursorVisibility.exchange(value != 0) != (value != 0)) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSNotificationCenter.defaultCenter postNotificationName:@"SRDMUnityCursorChanged" object:nil];
+        });
+    }
 }
 
 void ObserveCursorLock(int mode) {
     originalCursorLock(mode);
-    cursorLockMode.store(mode);
+    if (cursorLockMode.exchange(mode) != mode) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [NSNotificationCenter.defaultCenter postNotificationName:@"SRDMUnityCursorChanged" object:nil];
+        });
+    }
 }
 
-const section_64 *FindSection(const mach_header_64 &header, const char *segmentName, const char *sectionName) {
+} // namespace
+
+const section_64 *SRDMFindSection(const mach_header_64 &header, const char *segmentName, const char *sectionName) {
     const auto *cursor = reinterpret_cast<const uint8_t *>(&header + 1);
     uint32_t remaining = header.sizeofcmds;
     for (uint32_t i = 0; i < header.ncmds; ++i) {
@@ -81,6 +91,8 @@ const section_64 *FindSection(const mach_header_64 &header, const char *segmentN
     }
     return nullptr;
 }
+
+namespace {
 
 kern_return_t ReplaceCall(uint32_t *word, uint32_t expected, uint32_t replacement) {
     if (*word != expected) return KERN_INVALID_ARGUMENT;
@@ -107,7 +119,7 @@ kern_return_t ReplaceCall(uint32_t *word, uint32_t expected, uint32_t replacemen
 template<size_t Count>
 bool ApplyChecks(const mach_header_64 &verifiedImage, intptr_t slide,
                  const std::array<LayoutCheck, Count> &checks, uint32_t replacement) {
-    const auto *code = FindSection(verifiedImage, "__TEXT", "__text");
+    const auto *code = SRDMFindSection(verifiedImage, "__TEXT", "__text");
     if (!code || code->size < 2 * sizeof(uint32_t)) return false;
     std::array<uint32_t *, Count> words{};
     for (size_t i = 0; i < Count; ++i) {
@@ -144,7 +156,7 @@ bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide
 }
 
 bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide) {
-    const auto *data = FindSection(verifiedImage, "__DATA", "__common");
+    const auto *data = SRDMFindSection(verifiedImage, "__DATA", "__common");
     constexpr size_t tableSize = 4 * sizeof(uintptr_t);
     if (!data || data->size < tableSize || UnityCursorTable < data->addr ||
         UnityCursorTable - data->addr > data->size - tableSize) return false;

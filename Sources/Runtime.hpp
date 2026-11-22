@@ -15,6 +15,9 @@ struct SRDMUnityCursorState {
 SRDMUnityCursorState SRDMRequestedCursor();
 void SRDMStartDiagnostics(void);
 void SRDMSampleGraphics(CAMetalLayer *layer);
-bool SRDMInstallMouseSampling(void);
-void SRDMFlushMouse(bool cameraOwnsInput, double gain, CAMetalLayer *layer);
-bool SRDMHasGameMouseHandler(void);
+const section_64 *SRDMFindSection(const mach_header_64 &, const char *segmentName, const char *sectionName);
+bool SRDMInstallMouse(const mach_header_64 &verifiedImage, intptr_t slide);
+void SRDMSetCameraMouseCapture(bool enabled, double gain);
+bool SRDMInstallKeyboard(const mach_header_64 &verifiedImage, intptr_t slide);
+bool SRDMGameAcceptsKeyboard(void);
+void SRDMReleaseKeyboard(void);

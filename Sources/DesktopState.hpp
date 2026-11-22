@@ -102,6 +102,32 @@ private:
     Point pending_;
 };
 
+class FrameMotion {
+public:
+    void add(double x, double y) { pending_.add(x, y); }
+
+    Point sample(uint32_t frame, double gain) {
+        if (!sampled_ || frame != frame_) {
+            frame_ = frame;
+            value_ = pending_.take(gain);
+            sampled_ = true;
+        }
+        return value_;
+    }
+
+    void reset() {
+        pending_ = {};
+        value_ = {};
+        sampled_ = false;
+    }
+
+private:
+    RelativeMotion pending_;
+    Point value_;
+    uint32_t frame_ = 0;
+    bool sampled_ = false;
+};
+
 inline double SensitivityGain(double setting) {
     if (!std::isfinite(setting)) return 1;
     return std::clamp(setting, 0.0, 100.0) / 50.0;

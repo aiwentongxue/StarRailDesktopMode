@@ -1,8 +1,11 @@
 #include "DesktopState.hpp"
+#include "KeyboardState.hpp"
 
 #include <cassert>
 #include <iostream>
 #include <limits>
+#include <utility>
+#include <vector>
 
 int main() {
     using namespace starrail;
@@ -44,5 +47,43 @@ int main() {
     assert(SensitivityGain(50) == 1);
     assert(SensitivityGain(-10) == 0);
     assert(SensitivityGain(200) == 2);
+
+    FrameMotion camera;
+    camera.add(2, -3);
+    camera.add(1, 2);
+    assert(camera.sample(10, 2).x == 6);
+    camera.add(4, 5);
+    assert(camera.sample(10, 2).y == -2);
+    assert(camera.sample(11, 2).x == 8);
+    assert(camera.sample(11, 2).y == 10);
+    assert(camera.sample(12, 2).x == 0);
+    camera.add(10, 10);
+    camera.reset();
+    assert(camera.sample(12, 2).y == 0);
+
+    const auto w = UnityKey(13);
+    const auto a = UnityKey(0);
+    const auto shift = UnityKey(56);
+    assert(w == 'w' && a == 'a' && shift == 304 && UnityKey(60) == 303);
+    assert(UnityKey(123) == 276 && UnityKey(999) == 0);
+    KeyState keys;
+    std::vector<std::pair<uint16_t, bool>> changes;
+    const auto send = [&](uint16_t key, bool down) { changes.emplace_back(key, down); };
+    keys.update(w, true, send);
+    keys.update(w, true, send);
+    keys.update(shift, true, send);
+    keys.update(a, true, send);
+    keys.update(shift, false, send);
+    keys.update(a, false, send);
+    assert(keys.pressed(w));
+    keys.update(w, false, send);
+    keys.update(w, true, send);
+    keys.update(a, true, send);
+    keys.releaseAll(send);
+    keys.releaseAll(send);
+    assert((changes == decltype(changes){
+        {w, true}, {shift, true}, {a, true}, {shift, false}, {a, false}, {w, false},
+        {w, true}, {a, true}, {a, false}, {w, false},
+    }));
     std::cout << "DesktopState tests passed\n";
 }

@@ -84,8 +84,8 @@ Rect ScreenViewport(id window, UIView *view, double primaryTop) {
 
 bool IsEditing(id window) {
     id responder = Send(window, "firstResponder");
-    if ([responder isKindOfClass:NSClassFromString(@"NSTextView")]) return true;
-    return false;
+    return [responder isKindOfClass:NSClassFromString(@"NSTextView")] ||
+           [responder isKindOfClass:NSClassFromString(@"NSTextField")];
 }
 
 bool GameReceivesPointerAt(UIView *view, const Rect &bounds, Point point) {
@@ -120,6 +120,25 @@ void SetGamePointerLock(UIViewController *controller, bool locked) {
     }
     objc_setAssociatedObject(controller, &gameLockPreference, @(locked), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [controller setNeedsUpdateOfPrefersPointerLocked];
+}
+
+bool SetQuartzPointerCapture(bool enabled) {
+    using Associate = CGError (*)(boolean_t);
+    using ChangeVisibility = CGError (*)(CGDirectDisplayID);
+    static const auto associate = reinterpret_cast<Associate>(dlsym(RTLD_DEFAULT, "CGAssociateMouseAndMouseCursorPosition"));
+    static const auto hide = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayHideCursor"));
+    static const auto show = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayShowCursor"));
+    if (!associate || !hide || !show) return false;
+
+    if (!enabled) {
+        associate(true);
+        show(kCGNullDirectDisplay);
+        return false;
+    }
+    if (associate(false) != kCGErrorSuccess) return false;
+    if (hide(kCGNullDirectDisplay) == kCGErrorSuccess) return true;
+    associate(true);
+    return false;
 }
 
 using SetCursor = void (*)(id, SEL);
@@ -213,6 +232,14 @@ NSURL *SRDMApplicationSupport(void) {
     return [base URLByAppendingPathComponent:@"StarRailDesktopMode" isDirectory:YES];
 }
 
+bool SRDMGameAcceptsKeyboard() {
+    id app = MacApplication();
+    if (!Send<BOOL>(app, "isActive")) return false;
+    id window = Send(app, "keyWindow");
+    return Send<BOOL>(window, "isKeyWindow") && !Send<BOOL>(window, "isSheet") &&
+           !IsEditing(window) && ForegroundMetalView();
+}
+
 @interface SRDMPlayCoverHost : NSObject
 - (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide;
 - (void)frame:(CADisplayLink *)displayLink;
@@ -222,11 +249,14 @@ NSURL *SRDMApplicationSupport(void) {
     starrail::PointerTransition _pointer;
     __weak UIView *_lastView;
     __weak UIViewController *_lockController;
+    __weak id _mouseTrackingWindow;
+    BOOL _initialMouseMovedEvents;
+    bool _quartzPointerCaptured;
+    bool _attemptedQuartzCapture;
     double _gain;
     bool _diagnosticsOnly;
     bool _diagnosticsEnabled;
     bool _loggedViewport;
-    bool _loggedMouseRoute;
     bool _loggedHostContext;
     bool _playToolsCursorHidden;
     bool _desktopLayout;
@@ -256,9 +286,10 @@ NSURL *SRDMApplicationSupport(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             const bool enabled = SRDMEnableDesktopCursor(*header, slide);
             NSLog(@"[StarRailDesktopMode] game cursor lifecycle=%d", enabled);
+            NSLog(@"[StarRailDesktopMode] native keyboard=%d", SRDMInstallKeyboard(*header, slide));
+            NSLog(@"[StarRailDesktopMode] native mouse axes=%d", SRDMInstallMouse(*header, slide));
         });
         _gain = CameraGain();
-        SRDMInstallMouseSampling();
         customCursor = LoadCursor();
         if (customCursor) {
             Method setter = class_getInstanceMethod(NSClassFromString(@"NSCursor"), sel_registerName("set"));
@@ -267,6 +298,10 @@ NSURL *SRDMApplicationSupport(void) {
         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
         [center addObserver:self selector:@selector(pointerLockChanged:)
                       name:UIPointerLockStateDidChangeNotification object:nil];
+        [center addObserver:self selector:@selector(pointerLockChanged:)
+                      name:@"SRDMUnityCursorChanged" object:nil];
+        [center addObserver:self selector:@selector(pointerLockChanged:)
+                      name:@"NSWindowDidBecomeKeyNotification" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillHide:)
                       name:@"playtools.cursorWillHide" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillShow:)
@@ -275,6 +310,8 @@ NSURL *SRDMApplicationSupport(void) {
                       name:UIApplicationWillResignActiveNotification object:nil];
         [center addObserver:self selector:@selector(lostFocus:)
                       name:@"NSApplicationWillResignActiveNotification" object:nil];
+        [center addObserver:self selector:@selector(lostFocus:)
+                      name:@"NSApplicationWillTerminateNotification" object:nil];
     }
     CADisplayLink *displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     displayLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
@@ -288,8 +325,30 @@ NSURL *SRDMApplicationSupport(void) {
     _pointer.update(false, true);
     SetGamePointerLock(_lockController, false);
     _lockController = nil;
-    SRDMFlushMouse(false, _gain, nil);
+    SRDMSetCameraMouseCapture(false, _gain);
+    [self updateQuartzCapture:false];
+    [self setMouseTrackingWindow:nil];
+    SRDMReleaseKeyboard();
     RefreshCursor(false);
+}
+
+- (void)updateQuartzCapture:(bool)requested {
+    if (!requested) {
+        if (_quartzPointerCaptured) _quartzPointerCaptured = SetQuartzPointerCapture(false);
+        _attemptedQuartzCapture = false;
+    } else if (!_attemptedQuartzCapture) {
+        _attemptedQuartzCapture = true;
+        _quartzPointerCaptured = SetQuartzPointerCapture(true);
+        if (_diagnosticsEnabled) NSLog(@"[StarRailDesktopMode] Quartz pointer capture=%d", _quartzPointerCaptured);
+    }
+}
+
+- (void)setMouseTrackingWindow:(id)window {
+    if (_mouseTrackingWindow == window) return;
+    Send<void>(_mouseTrackingWindow, "setAcceptsMouseMovedEvents:", _initialMouseMovedEvents);
+    _mouseTrackingWindow = window;
+    _initialMouseMovedEvents = Send<BOOL>(window, "acceptsMouseMovedEvents");
+    Send<void>(window, "setAcceptsMouseMovedEvents:", YES);
 }
 
 - (void)playToolsCursorWillHide:(NSNotification *)notification {
@@ -312,12 +371,14 @@ NSURL *SRDMApplicationSupport(void) {
 - (void)updatePointer {
     id app = MacApplication();
     id window = Send(app, "keyWindow");
-    UIView *view = Send<BOOL>(app, "isActive") ? ForegroundMetalView() : nil;
+    const bool appActive = Send<BOOL>(app, "isActive");
+    UIView *view = appActive ? ForegroundMetalView() : nil;
     NSArray *screens = Send(NSClassFromString(@"NSScreen"), "screens");
     const CGRect primaryScreen = Send<CGRect>(screens.firstObject, "frame");
     const double primaryTop = CGRectGetMaxY(primaryScreen);
     const starrail::Rect viewport = screens.count ? ScreenViewport(window, view, primaryTop) : starrail::Rect{};
     const bool gameOwns = viewport.valid() && !IsEditing(window);
+    if (!gameOwns) SRDMReleaseKeyboard();
     if (_diagnosticsEnabled && view && !_loggedHostContext) {
         _loggedHostContext = true;
         NSLog(@"[StarRailDesktopMode] window key=%d scene_view=%.0fx%.0f valid_viewport=%d editing=%d",
@@ -333,9 +394,11 @@ NSURL *SRDMApplicationSupport(void) {
         _lockController = controller;
     }
     const auto requested = SRDMRequestedCursor();
-    const bool needsLock = requested.known && !requested.visible && requested.locked && !_playToolsCursorHidden;
-    SetGamePointerLock(_lockController, needsLock);
-    const bool locked = view.window.windowScene.pointerLockState.isLocked;
+    const bool needsLock = gameOwns && requested.known && !requested.visible &&
+                           requested.locked && !_playToolsCursorHidden;
+    [self updateQuartzCapture:needsLock];
+    SetGamePointerLock(_lockController, needsLock && !_quartzPointerCaptured);
+    const bool locked = _quartzPointerCaptured || view.window.windowScene.pointerLockState.isLocked;
     const bool systemVisible = !cursorVisible || cursorVisible() != 0;
     const bool visible = !locked && !_playToolsCursorHidden && systemVisible && (!requested.known || requested.visible);
     const CGPoint mousePosition = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
@@ -343,10 +406,14 @@ NSURL *SRDMApplicationSupport(void) {
 
     if (_lastView != view) {
         _pointer.update(false, true);
+        SRDMSetCameraMouseCapture(false, _gain);
         _lastView = view;
     }
     const bool pointerInside = gameOwns && GameReceivesPointerAt(view, viewport, mouse);
     const bool shouldCenter = _pointer.update(gameOwns && (visible || needsLock || locked || _playToolsCursorHidden || pointerInside), visible);
+    const bool cameraCapture = needsLock && locked;
+    [self setMouseTrackingWindow:cameraCapture ? window : nil];
+    SRDMSetCameraMouseCapture(cameraCapture, _gain);
     if (shouldCenter && warp) {
         const auto spot = viewport.center();
         if (warp(CGPointMake(spot.x, spot.y)) == kCGErrorSuccess) {
@@ -358,8 +425,6 @@ NSURL *SRDMApplicationSupport(void) {
             }
         }
     }
-    SRDMFlushMouse(gameOwns && !_playToolsCursorHidden && (needsLock || locked || (!visible && pointerInside)),
-                   _gain, (CAMetalLayer *)view.layer);
     RefreshCursor(gameOwns && visible && GameReceivesPointerAt(view, viewport, mouse));
 
     if (_diagnosticsEnabled && gameOwns && !_loggedViewport) {
@@ -373,10 +438,6 @@ NSURL *SRDMApplicationSupport(void) {
     if (_desktopLayout) [self updatePointer];
     if (!_diagnosticsEnabled) return;
     SRDMSampleGraphics((CAMetalLayer *)ForegroundMetalView().layer);
-    if (!_loggedMouseRoute && SRDMHasGameMouseHandler()) {
-        _loggedMouseRoute = true;
-        NSLog(@"[StarRailDesktopMode] Unity installed a native mouse handler");
-    }
 }
 @end
 

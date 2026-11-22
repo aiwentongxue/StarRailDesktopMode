@@ -9,7 +9,7 @@
 | arm64 Mac Catalyst 构建与签名 | 通过 |
 | 配置匹配、视口坐标、回中状态、合并位移单测 | 通过 |
 | 新 dylib 单独加载并进入游戏世界 | 通过。仅加载本插件，关闭 PlayCover 键盘映射。日志显示 `desktop_layout=1`，世界界面出现 `V`、`Enter`、队伍 `1`–`4`、`E` 和鼠标图标 |
-| 原生桌面输入 | `W` 能移动角色，`M` 能打开地图，`Esc` 能返回并打开手机菜单，鼠标能点击图像设定。短按 WASD 仍有延迟和过量位移。地图拖拽尚未通过，镜头、战斗、焦点切换、手柄和高回报率待验收 |
+| 原生桌面输入 | 用户确认短按 W、长按 W 加 A 或 Shift、松开部分或全部按键均正常。`M` 能打开地图，`Esc` 能返回并打开手机菜单，鼠标能点击图像设定。地图拖拽、战斗、文本输入、手柄和高回报率待验收 |
 | 加载本机光标 PNG | 运行日志确认 `custom_arrow=1`。实际箭头替换待验收 |
 | 探索到地图的光标回中 | 用户在窗口模式按 `M` 打开地图后确认回到画面中心。两点误差阈值、连续切换、全屏、副屏及游戏指针同步待验收 |
 
@@ -17,13 +17,17 @@
 
 PlayCover 键盘映射关闭，固定约 30 FPS。完整独立插件和仅启用 PC 布局的独立实验均复现按下、松开滞后及短按位移过大。用户用同一机器对照旧插件，确认其短按和松开响应正常。
 
-在两组采样中，AppKit 均收到移动键按下和松开。独立插件的短按样本中，事件到达进程的时间通常在数毫秒至十几毫秒内。游戏的输入管理器在两组均显示模式 `2`，仍需追踪实际移动轴计算。停用触屏事件处理会影响登录点击，保留桌面输入初始化选项也未解决延迟。两项实验均已撤回。
+在两组采样中，AppKit 均收到移动键按下和松开。独立插件的短按样本中，事件到达进程的时间通常在数毫秒至十几毫秒内。游戏的输入管理器在两组均显示模式 `2`。
 
 持续按 `W` 时短按 Shift，用户确认角色加速后停跑。Shift 松开后约 1.1 秒，Quartz 与 GameController 的 `W` 状态仍持续为按下，AppKit 在实际松手时才记录到 `W` 松开。持续按 `W` 与 `A` 也会停跑或丢掉一个方向。该组记录中两个键各自的按下和松开事件完整。
 
+在国服 UnityFramework 的原生键盘实现中，`UnityView.processKeyboard` 对 UIKeyCommand 生成的按键以 0.5 秒超时补发松开。新桥接在游戏窗口拥有输入时，直接把 AppKit 的按下和松开传给同一 Unity 原生入口，并独立跟踪各键。用户使用仅加载独立插件的测试版复测，确认短按 W，以及长按 W 时交替按放 A 和 Shift，移动开始、持续和停止均正常。[Unity Input.GetKey 文档](https://docs.unity3d.com/jp/current/ScriptReference/Input.GetKey.html)
+
 ## 光标切换
 
-探针在国服 4.7.0 记录到游戏探索时请求隐藏和锁定指针。独立构建已监听这两个游戏请求，并在窗口和视口接管指针时请求 Catalyst 锁定。系统在窗口失焦时交还指针，插件同步清除捕获和相对位移。系统可能在窗口重新获得焦点后等待一次点击再锁定。[Apple Catalyst 指针锁定](https://developer.apple.com/documentation/uikit/uiviewcontroller/preferspointerlocked?language=objc)
+游戏探索时请求隐藏和锁定指针，打开地图时请求显示并解锁。宿主优先在前台游戏窗口用 Quartz 同步隐藏并捕获指针，失败时请求 Catalyst 指针锁定。镜头只在捕获成功时接收位移。菜单和失焦会释放捕获并清除累计位移。[Apple Quartz 相对指针](https://developer.apple.com/documentation/coregraphics/cgassociatemouseandmousecursorposition(_:)) · [Apple Catalyst 指针锁定](https://developer.apple.com/documentation/uikit/uiviewcontroller/preferspointerlocked?language=objc)
+
+独立输入测试中，国服客户端从 `mouse x`、`mouse y` 读取镜头位移。日志记录了 AppKit 位移累加、Unity 帧计数以及菜单和失焦时释放捕获。用户确认光标隐藏时可以直接转动镜头，横向和纵向方向正常。基础镜头增益调为初版的 2.5 倍，继续使用 PlayCover 灵敏度。用户复测确认速度合适，松开 Option 后指针立即隐藏并恢复转向。
 
 ## 图形设置对照
 
