@@ -16,6 +16,8 @@ constexpr uintptr_t GetAxisTarget = 0x100c6724;
 constexpr uintptr_t GetAxisRawTarget = 0x100c68a4;
 constexpr uintptr_t MousePresentSlot = 0x1656e0e0;
 constexpr uintptr_t MousePresentTarget = 0x100c7900;
+constexpr uintptr_t ScrollDeltaSlot = 0x1656e180;
+constexpr uintptr_t ScrollDeltaTarget = 0x100c76bc;
 constexpr uintptr_t FrameCountWrapper = 0x0f145a20;
 constexpr uintptr_t FrameCountSlot = 0x165729f0;
 constexpr uintptr_t FrameCountTarget = 0x107d5750;
@@ -30,13 +32,16 @@ struct UnityString {
 
 using AxisGetter = float (*)(const UnityString *);
 using FrameGetter = uint32_t (*)();
+using VectorGetter = void (*)(float *);
 AxisGetter originalAxis;
 AxisGetter originalRawAxis;
 FrameGetter frameCount;
+VectorGetter originalScroll;
 id mouseMonitor;
 
 std::mutex motionLock;
 starrail::FrameMotion motion;
+starrail::FrameMotion scroll;
 bool captured;
 double gain;
 double captureStarted;
@@ -85,6 +90,30 @@ bool GetMousePresent() {
     return true;
 }
 
+void GetScrollDelta(float *output) {
+    {
+        std::lock_guard lock(motionLock);
+        if (captured && !SRDMRequestedCursor().visible) {
+            const auto delta = scroll.sample(frameCount(), 1);
+            output[0] = static_cast<float>(delta.x);
+            output[1] = static_cast<float>(delta.y);
+            return;
+        }
+    }
+    originalScroll(output);
+}
+
+id ReceiveScroll(id event) {
+    if (!SRDMGameAcceptsKeyboard()) return event;
+    std::lock_guard lock(motionLock);
+    if (!captured || SRDMRequestedCursor().visible) return event;
+    const bool precise = ReadEvent<BOOL>(event, "hasPreciseScrollingDeltas");
+    const double multiplier = precise ? 1.0 / 16.0 : 1.0;
+    scroll.add(ReadEvent<CGFloat>(event, "scrollingDeltaX") * multiplier,
+               ReadEvent<CGFloat>(event, "scrollingDeltaY") * multiplier);
+    return nil;
+}
+
 void Accumulate(id event) {
     std::lock_guard lock(motionLock);
     if (!captured || ReadEvent<double>(event, "timestamp") < captureStarted) return;
@@ -95,6 +124,7 @@ void Accumulate(id event) {
 
 id ReceiveEvent(id event) {
     const auto type = ReadEvent<NSUInteger>(event, "type");
+    if (type == 22) return ReceiveScroll(event);
     const bool down = type == 1 || type == 3 || type == 25;
     const bool up = type == 2 || type == 4 || type == 26;
     if (!down && !up) {
@@ -125,14 +155,17 @@ bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
     if (!Contains(text, FrameCountWrapper, sizeof(FrameCountWords)) ||
         !Contains(data, AxisTable, 2 * sizeof(uintptr_t)) ||
         !Contains(data, MousePresentSlot, sizeof(uintptr_t)) ||
+        !Contains(data, ScrollDeltaSlot, sizeof(uintptr_t)) ||
         !Contains(data, FrameCountSlot, sizeof(uintptr_t)) ||
         std::memcmp(reinterpret_cast<const void *>(slide + FrameCountWrapper),
                     FrameCountWords.data(), sizeof(FrameCountWords)) != 0) return false;
     auto *axes = reinterpret_cast<uintptr_t *>(slide + AxisTable);
     auto *presence = reinterpret_cast<uintptr_t *>(slide + MousePresentSlot);
+    auto *wheel = reinterpret_cast<uintptr_t *>(slide + ScrollDeltaSlot);
     const auto frameTarget = *reinterpret_cast<const uintptr_t *>(slide + FrameCountSlot);
     if (axes[0] != slide + GetAxisTarget || axes[1] != slide + GetAxisRawTarget ||
         *presence != slide + MousePresentTarget ||
+        *wheel != slide + ScrollDeltaTarget ||
         frameTarget != slide + FrameCountTarget) return false;
 
     Class events = NSClassFromString(@"NSEvent");
@@ -141,17 +174,20 @@ bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
     constexpr uint64_t MotionEvents = (1ULL << 5) | (1ULL << 6) | (1ULL << 7) | (1ULL << 27);
     constexpr uint64_t ButtonEvents = (1ULL << 1) | (1ULL << 2) | (1ULL << 3) |
                                       (1ULL << 4) | (1ULL << 25) | (1ULL << 26);
+    constexpr uint64_t ScrollEvent = 1ULL << 22;
     id (^handle)(id) = ^id(id event) { return ReceiveEvent(event); };
     mouseMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(
-        events, addMonitor, MotionEvents | ButtonEvents, handle);
+        events, addMonitor, MotionEvents | ButtonEvents | ScrollEvent, handle);
     if (!mouseMonitor) return false;
 
     originalAxis = reinterpret_cast<AxisGetter>(axes[0]);
     originalRawAxis = reinterpret_cast<AxisGetter>(axes[1]);
     frameCount = reinterpret_cast<FrameGetter>(frameTarget);
+    originalScroll = reinterpret_cast<VectorGetter>(*wheel);
     __atomic_store_n(axes, reinterpret_cast<uintptr_t>(GetAxis), __ATOMIC_RELEASE);
     __atomic_store_n(axes + 1, reinterpret_cast<uintptr_t>(GetAxisRaw), __ATOMIC_RELEASE);
     __atomic_store_n(presence, reinterpret_cast<uintptr_t>(GetMousePresent), __ATOMIC_RELEASE);
+    __atomic_store_n(wheel, reinterpret_cast<uintptr_t>(GetScrollDelta), __ATOMIC_RELEASE);
     return true;
 }
 
@@ -164,6 +200,7 @@ void SRDMSetCameraMouseCapture(bool enabled, double sensitivity, CGPoint warp) {
         captured = enabled;
         captureStarted = NSProcessInfo.processInfo.systemUptime;
         motion.reset({warp.x, warp.y});
+        scroll.reset();
     }
     if (!enabled && mouseButtons.any()) {
         for (unsigned button = 0; button < mouseButtons.size(); ++button) {
