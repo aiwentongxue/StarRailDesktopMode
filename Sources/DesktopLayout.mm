@@ -9,31 +9,37 @@
 
 namespace {
 
-struct LayoutCheck {
+struct InstructionChange {
     uint32_t address;
-    uint32_t call;
-    uint32_t branch;
+    uint32_t original;
+    uint32_t following;
+    uint32_t replacement;
 };
 
-// CN 4.7.0 build 1. The first two checks select the desktop presentation.
-// The last enables the desktop input path for that presentation. All three
-// originally call the same predicate. The game's platform value is unchanged.
-constexpr std::array LayoutChecks{
-    LayoutCheck{0x01d355a8, 0x97cf61d9, 0x37000160},
-    LayoutCheck{0x01d3576c, 0x97cf6168, 0x37000160},
-    LayoutCheck{0x0253eb60, 0x97af3c6b, 0x360000a0},
-};
 constexpr uint32_t TrueInResultRegister = 0x52800020; // mov w0, #1
 constexpr uint32_t FalseInResultRegister = 0x52800000; // mov w0, #0
+constexpr uint32_t NoOperation = 0xd503201f; // nop
+
+// CN 4.7.0 build 1. Enable the desktop input path and presentation at
+// their call sites, preserving the game's platform value.
+constexpr std::array LayoutChanges{
+    InstructionChange{0x01d355a8, 0x97cf61d9, 0x37000160, TrueInResultRegister},
+    InstructionChange{0x01d3576c, 0x97cf6168, 0x37000160, TrueInResultRegister},
+    InstructionChange{0x0253eb60, 0x97af3c6b, 0x360000a0, TrueInResultRegister},
+    // Keep the EventSystem navigation defaults during mobile initialization.
+    // Subsequent game updates can still change navigation for individual menus.
+    InstructionChange{0x019e13b4, 0x3900c01f, 0x958ce4ae, NoOperation},
+    InstructionChange{0x019e13c0, 0x3900c41f, 0xa9427bfd, NoOperation},
+};
 
 // These call sites skip the game cursor lifecycle on mobile. Keep the
 // keyboard/mouse and controller checks after each predicate intact.
-constexpr std::array CursorChecks{
-    LayoutCheck{0x01d91ec4, 0x97cdef6a, 0x37000180},
-    LayoutCheck{0x01d91fc4, 0x97cdef2a, 0x37000240},
-    LayoutCheck{0x01d92164, 0x97cdeec2, 0x37000160},
-    LayoutCheck{0x01d92204, 0x97cdee9a, 0x370004e0},
-    LayoutCheck{0x01d924c0, 0x97cdedeb, 0x36000060},
+constexpr std::array CursorChanges{
+    InstructionChange{0x01d91ec4, 0x97cdef6a, 0x37000180, FalseInResultRegister},
+    InstructionChange{0x01d91fc4, 0x97cdef2a, 0x37000240, FalseInResultRegister},
+    InstructionChange{0x01d92164, 0x97cdeec2, 0x37000160, FalseInResultRegister},
+    InstructionChange{0x01d92204, 0x97cdee9a, 0x370004e0, FalseInResultRegister},
+    InstructionChange{0x01d924c0, 0x97cdedeb, 0x36000060, FalseInResultRegister},
 };
 
 // The managed Cursor methods dispatch through Unity's writable delegate table.
@@ -94,7 +100,7 @@ const section_64 *SRDMFindSection(const mach_header_64 &header, const char *segm
 
 namespace {
 
-kern_return_t ReplaceCall(uint32_t *word, uint32_t expected, uint32_t replacement) {
+kern_return_t ReplaceInstruction(uint32_t *word, uint32_t expected, uint32_t replacement) {
     if (*word != expected) return KERN_INVALID_ARGUMENT;
     const auto task = mach_task_self();
     const auto address = reinterpret_cast<mach_vm_address_t>(word);
@@ -117,16 +123,16 @@ kern_return_t ReplaceCall(uint32_t *word, uint32_t expected, uint32_t replacemen
 }
 
 template<size_t Count>
-bool ApplyChecks(const mach_header_64 &verifiedImage, intptr_t slide,
-                 const std::array<LayoutCheck, Count> &checks, uint32_t replacement) {
+bool ApplyChanges(const mach_header_64 &verifiedImage, intptr_t slide,
+                  const std::array<InstructionChange, Count> &changes) {
     const auto *code = SRDMFindSection(verifiedImage, "__TEXT", "__text");
     if (!code || code->size < 2 * sizeof(uint32_t)) return false;
     std::array<uint32_t *, Count> words{};
     for (size_t i = 0; i < Count; ++i) {
-        const auto &check = checks[i];
+        const auto &check = changes[i];
         if (check.address < code->addr || check.address - code->addr > code->size - 2 * sizeof(uint32_t)) return false;
         auto *word = reinterpret_cast<uint32_t *>(slide + check.address);
-        if (word[0] != check.call || word[1] != check.branch) {
+        if (word[0] != check.original || word[1] != check.following) {
             NSLog(@"[StarRailDesktopMode] Unity input check did not match at 0x%x", check.address);
             return false;
         }
@@ -134,14 +140,14 @@ bool ApplyChecks(const mach_header_64 &verifiedImage, intptr_t slide,
     }
 
     for (size_t i = 0; i < words.size(); ++i) {
-        const auto status = ReplaceCall(words[i], checks[i].call, replacement);
+        const auto status = ReplaceInstruction(words[i], changes[i].original, changes[i].replacement);
         if (status == KERN_SUCCESS) continue;
         NSLog(@"[StarRailDesktopMode] Unity input change failed at 0x%x, status=%d",
-              checks[i].address, status);
+              changes[i].address, status);
         for (size_t previous = i; previous > 0; --previous) {
             const auto index = previous - 1;
-            if (ReplaceCall(words[index], replacement, checks[index].call) != KERN_SUCCESS) {
-                NSLog(@"[StarRailDesktopMode] could not restore Unity input call at 0x%x", checks[index].address);
+            if (ReplaceInstruction(words[index], changes[index].replacement, changes[index].original) != KERN_SUCCESS) {
+                NSLog(@"[StarRailDesktopMode] could not restore Unity input instruction at 0x%x", changes[index].address);
             }
         }
         return false;
@@ -152,7 +158,7 @@ bool ApplyChecks(const mach_header_64 &verifiedImage, intptr_t slide,
 } // namespace
 
 bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide) {
-    return ApplyChecks(verifiedImage, slide, LayoutChecks, TrueInResultRegister);
+    return ApplyChanges(verifiedImage, slide, LayoutChanges);
 }
 
 bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide) {
@@ -162,7 +168,7 @@ bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide
         UnityCursorTable - data->addr > data->size - tableSize) return false;
     auto *slots = reinterpret_cast<uintptr_t *>(slide + UnityCursorTable);
     if (slots[1] != slide + CursorVisibilityDelegate || slots[3] != slide + CursorLockDelegate) return false;
-    if (!ApplyChecks(verifiedImage, slide, CursorChecks, FalseInResultRegister)) return false;
+    if (!ApplyChanges(verifiedImage, slide, CursorChanges)) return false;
     originalCursorVisibility = reinterpret_cast<CursorSetter>(slots[1]);
     originalCursorLock = reinterpret_cast<CursorSetter>(slots[3]);
     __atomic_store_n(slots + 1, reinterpret_cast<uintptr_t>(ObserveCursorVisibility), __ATOMIC_RELEASE);

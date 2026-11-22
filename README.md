@@ -2,7 +2,7 @@
 
 StarRailDesktopMode 在 PlayCover 里启用《崩坏：星穹铁道》iOS 客户端自带的 PC 键鼠布局。首个版本验证于 Apple Silicon、PlayCover 3.1.0 和国服 iOS 4.7.0 build 1。插件以独立的 arm64 Mac Catalyst dylib 交付，源码按 MIT 授权。
 
-已验证的操作包括 WASD 短按与组合键、右键冲刺、隐藏光标时转动镜头、探索中的滚轮缩放和交互选项切换、Option 呼出和重新锁定，以及打开地图时光标回到视口中心。鼠标灵敏度沿用 PlayCover 设置。
+已验证的操作包括 WASD 短按与组合键、右键冲刺、隐藏光标时转动镜头、探索中的滚轮缩放和交互选项切换、Option 呼出和重新锁定，以及打开地图时光标回到视口中心。鼠标灵敏度沿用 PlayCover 设置。手柄左摇杆和十字键可在手机菜单中移动选中项，移动鼠标即可切回键鼠。
 
 ## 安装
 
