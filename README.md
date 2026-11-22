@@ -2,7 +2,7 @@
 
 《崩坏：星穹铁道》在 PlayCover 上的桌面输入兼容性预览。当前客户端配置为国服 iOS 4.7.0 build 1，运行时核对 Bundle ID 和 UnityFramework UUID。适配以独立 Mac Catalyst dylib 交付。
 
-当前版本可以在 PlayCover 加载并进入游戏。独立运行时，国服仍使用触控 UI。原生 PC 键位、原生桌面输入和游戏内 0.6、0.8、1.0 渲染精度尚未完成。具体结果见 [真机验证](VERIFICATION.md)。
+当前源码已能在国服 iOS 4.7.0 build 1 启用游戏自带的 PC 键鼠布局，独立运行时已验证键位提示、角色移动、地图快捷键和设置菜单点击。此前发布的 `v0.1.0-preview.1` 仍会进入触屏布局。光标回中和游戏内渲染精度仍待真机验收。具体结果见 [真机验证](VERIFICATION.md)。
 
 ## 构建
 
@@ -18,7 +18,7 @@
 ## 本地测试与恢复
 
 1. 退出游戏。在 PlayCover 的游戏设置中打开插件列表，将原有的 PC 模式 dylib 先保留一份，再从列表移除。
-2. 导入 `libStarRailDesktopMode.dylib`。启动后可在系统「控制台」按 `StarRailDesktopMode` 过滤，核对客户端配置是否匹配。
+2. 如果列表已有同名预览插件，先移除该条目，再导入这次构建的 `libStarRailDesktopMode.dylib`。确认 PlayCover 的「鍵盤映射」关闭，避免和游戏自身的键鼠输入叠加。启动后可在系统「控制台」按 `StarRailDesktopMode` 过滤，`desktop_layout=1` 表示 PC 布局已启用。
 3. 使用自定义箭头时，将本机的 64×64 PNG 命名为 `cursor.png`，放到以下目录，然后重启游戏。箭头以 32 点显示，热点按参考图箭尖设在 (8, 3) 点。其余应用与窗口控件使用自己的指针形状。
 
 ```text
@@ -39,6 +39,6 @@ log stream --style compact --predicate 'process == "hkrpg" AND eventMessage CONT
 
 ## 实现参考
 
-宿主通过 UIKit 和 AppKit 取游戏视口及指针锁状态。坐标和输入状态集中在 `DesktopState.hpp`。相对位移模块只包装 Unity 注册的原生鼠标回调，并以游戏 drawable 的节奏交付已合并的位移。图形探针只观察设置和渲染尺寸。
+客户端适配核对国服构建标识和各入口的原始指令，再在本进程启用游戏的桌面布局和输入分支。宿主通过 UIKit 和 AppKit 取游戏视口及指针锁状态。坐标和输入状态集中在 `DesktopState.hpp`。相对位移模块包装 Unity 注册的原生鼠标回调。图形探针记录设置和渲染尺寸。
 
 视口与光标做法参考 MIT 授权的 GenshinDesktopMode。插件由 PlayCover 的用户插件机制加载。[GenshinDesktopMode](https://github.com/cnSniperMike/GenshinDesktopMode) · [PlayCover 用户插件管理](https://github.com/PlayCover/PlayCover/blob/24bbed7/PlayCover/Utils/PlayTools.swift)

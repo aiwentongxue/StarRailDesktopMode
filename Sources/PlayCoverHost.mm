@@ -146,32 +146,40 @@ void RefreshCursor(bool owns) {
     }
 }
 
-bool HasVerifiedUnityImage() {
+struct UnityImage {
+    const mach_header_64 *header = nullptr;
+    intptr_t slide = 0;
+};
+
+UnityImage FindVerifiedUnityImage() {
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
         const char *name = _dyld_get_image_name(i);
         if (!name || !std::string_view(name).ends_with("/UnityFramework.framework/UnityFramework")) continue;
         const auto *header = reinterpret_cast<const mach_header_64 *>(_dyld_get_image_header(i));
-        if (!header || header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return false;
+        if (!header || header->magic != MH_MAGIC_64 || header->cputype != CPU_TYPE_ARM64) return {};
         const auto *cursor = reinterpret_cast<const uint8_t *>(header + 1);
         uint32_t remaining = header->sizeofcmds;
         for (uint32_t command = 0; command < header->ncmds; ++command) {
-            if (remaining < sizeof(load_command)) return false;
+            if (remaining < sizeof(load_command)) return {};
             const auto *item = reinterpret_cast<const load_command *>(cursor);
-            if (item->cmdsize < sizeof(load_command) || item->cmdsize > remaining) return false;
+            if (item->cmdsize < sizeof(load_command) || item->cmdsize > remaining) return {};
             if (item->cmd == LC_UUID && item->cmdsize == sizeof(uuid_command)) {
                 std::array<uint8_t, 16> uuid{};
                 std::memcpy(uuid.data(), reinterpret_cast<const uuid_command *>(item)->uuid, uuid.size());
                 NSBundle *bundle = NSBundle.mainBundle;
-                return starrail::Matches(starrail::China470, bundle.bundleIdentifier.UTF8String,
+                if (starrail::Matches(starrail::China470, bundle.bundleIdentifier.UTF8String,
                     [[bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] UTF8String] ?: "",
-                    [[bundle objectForInfoDictionaryKey:@"CFBundleVersion"] UTF8String] ?: "", uuid);
+                    [[bundle objectForInfoDictionaryKey:@"CFBundleVersion"] UTF8String] ?: "", uuid)) {
+                    return {header, _dyld_get_image_vmaddr_slide(i)};
+                }
+                return {};
             }
             cursor += item->cmdsize;
             remaining -= item->cmdsize;
         }
-        return false;
+        return {};
     }
-    return false;
+    return {};
 }
 
 } // namespace
@@ -182,7 +190,7 @@ NSURL *SRDMApplicationSupport(void) {
 }
 
 @interface SRDMPlayCoverHost : NSObject
-- (void)start;
+- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide;
 - (void)frame;
 @end
 
@@ -198,7 +206,7 @@ NSURL *SRDMApplicationSupport(void) {
     bool _playToolsCursorHidden;
 }
 
-- (void)start {
+- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide {
     NSURL *support = SRDMApplicationSupport();
     auto hasMarker = ^bool(NSString *name) {
         NSString *path = [support URLByAppendingPathComponent:name].path;
@@ -208,6 +216,7 @@ NSURL *SRDMApplicationSupport(void) {
     _diagnosticsEnabled = _diagnosticsOnly || hasMarker(@"diagnostics");
     if (_diagnosticsEnabled) SRDMStartDiagnostics();
 
+    bool desktopLayout = false;
     if (!_diagnosticsOnly) {
         NSURL *legacy = [[NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:@"UserPlugins"]
                          URLByAppendingPathComponent:@"libUnityDesktopMode.dylib"];
@@ -215,6 +224,7 @@ NSURL *SRDMApplicationSupport(void) {
             NSLog(@"[StarRailDesktopMode] remove the legacy desktop-mode plugin before enabling input");
             return;
         }
+        desktopLayout = SRDMEnableDesktopLayout(*header, slide);
         _gain = CameraGain();
         SRDMInstallMouseSampling();
         customCursor = LoadCursor();
@@ -235,8 +245,8 @@ NSURL *SRDMApplicationSupport(void) {
     CADisplayLink *displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame)];
     displayLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
     [displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[StarRailDesktopMode] host ready client=CN-4.7.0 diagnostic_only=%d custom_arrow=%d",
-          _diagnosticsOnly, customCursor != nil);
+    NSLog(@"[StarRailDesktopMode] host ready client=CN-4.7.0 diagnostic_only=%d desktop_layout=%d custom_arrow=%d",
+          _diagnosticsOnly, desktopLayout, customCursor != nil);
 }
 
 - (void)lostFocus:(NSNotification *)notification {
@@ -324,12 +334,13 @@ namespace {
 void Activate() {
     static bool attempted = false;
     if (attempted) return;
-    if (!HasVerifiedUnityImage()) {
+    const auto image = FindVerifiedUnityImage();
+    if (!image.header) {
         NSLog(@"[StarRailDesktopMode] Unity build does not match the CN-4.7.0 profile");
         return;
     }
     attempted = true;
-    [[[SRDMPlayCoverHost alloc] init] start];
+    [[[SRDMPlayCoverHost alloc] init] startWithImage:image.header slide:image.slide];
 }
 
 void ImageAdded(const mach_header *header, intptr_t) {
