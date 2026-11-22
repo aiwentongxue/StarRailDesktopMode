@@ -60,6 +60,11 @@ int main() {
     camera.add(10, 10);
     camera.reset();
     assert(camera.sample(12, 2).y == 0);
+    camera.reset({-420, 180});
+    camera.add(-416, 177);
+    assert(camera.sample(13, 1).x == 4 && camera.sample(13, 1).y == -3);
+    camera.add(2, 1);
+    assert(camera.sample(14, 1).x == 2 && camera.sample(14, 1).y == 1);
 
     const auto w = UnityKey(13);
     const auto a = UnityKey(0);

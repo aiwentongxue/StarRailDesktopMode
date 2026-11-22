@@ -110,3 +110,9 @@ bool SRDMInstallKeyboard(const mach_header_64 &image, intptr_t slide) {
 void SRDMReleaseKeyboard() {
     if (eventMonitor) held.releaseAll(SendKey);
 }
+
+bool SRDMSendMouseButton(unsigned button, bool down) {
+    if (!eventMonitor || button >= 7) return false;
+    sendUnityKey(static_cast<int>(323 + button), down); // Unity KeyCode.Mouse0 through Mouse6
+    return true;
+}

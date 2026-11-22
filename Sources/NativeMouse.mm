@@ -3,6 +3,7 @@
 
 #include "DesktopState.hpp"
 #include <array>
+#include <bitset>
 #include <cstring>
 #include <mutex>
 #include <string_view>
@@ -38,6 +39,8 @@ std::mutex motionLock;
 starrail::FrameMotion motion;
 bool captured;
 double gain;
+double captureStarted;
+std::bitset<7> mouseButtons;
 
 // The client applies its in-game camera sensitivity after this conversion.
 constexpr double PointsToAxis = 0.25;
@@ -84,10 +87,29 @@ bool GetMousePresent() {
 
 void Accumulate(id event) {
     std::lock_guard lock(motionLock);
-    if (!captured) return;
+    if (!captured || ReadEvent<double>(event, "timestamp") < captureStarted) return;
     const auto dx = ReadEvent<CGFloat>(event, "deltaX");
     const auto dy = ReadEvent<CGFloat>(event, "deltaY");
     motion.add(dx, -dy);
+}
+
+id ReceiveEvent(id event) {
+    const auto type = ReadEvent<NSUInteger>(event, "type");
+    const bool down = type == 1 || type == 3 || type == 25;
+    const bool up = type == 2 || type == 4 || type == 26;
+    if (!down && !up) {
+        Accumulate(event);
+        return event;
+    }
+    // The monitor and capture changes both run on the main thread.
+    if (!captured || SRDMRequestedCursor().visible) return event;
+    const auto button = ReadEvent<NSUInteger>(event, "buttonNumber");
+    if (button >= mouseButtons.size()) return event;
+    if (mouseButtons[button] != down) {
+        if (!SRDMSendMouseButton(static_cast<unsigned>(button), down)) return event;
+        mouseButtons[button] = down;
+    }
+    return nil;
 }
 
 bool Contains(const section_64 *section, uintptr_t offset, size_t size) {
@@ -117,12 +139,11 @@ bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
     const SEL addMonitor = sel_registerName("addLocalMonitorForEventsMatchingMask:handler:");
     if (![events respondsToSelector:addMonitor]) return false;
     constexpr uint64_t MotionEvents = (1ULL << 5) | (1ULL << 6) | (1ULL << 7) | (1ULL << 27);
-    id (^handle)(id) = ^id(id event) {
-        Accumulate(event);
-        return event;
-    };
+    constexpr uint64_t ButtonEvents = (1ULL << 1) | (1ULL << 2) | (1ULL << 3) |
+                                      (1ULL << 4) | (1ULL << 25) | (1ULL << 26);
+    id (^handle)(id) = ^id(id event) { return ReceiveEvent(event); };
     mouseMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(
-        events, addMonitor, MotionEvents, handle);
+        events, addMonitor, MotionEvents | ButtonEvents, handle);
     if (!mouseMonitor) return false;
 
     originalAxis = reinterpret_cast<AxisGetter>(axes[0]);
@@ -134,11 +155,20 @@ bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
     return true;
 }
 
-void SRDMSetCameraMouseCapture(bool enabled, double sensitivity) {
+void SRDMSetCameraMouseCapture(bool enabled, double sensitivity, CGPoint warp) {
     if (!mouseMonitor) return;
-    std::lock_guard lock(motionLock);
-    gain = sensitivity * PointsToAxis;
-    if (enabled == captured) return;
-    captured = enabled;
-    motion.reset();
+    {
+        std::lock_guard lock(motionLock);
+        gain = sensitivity * PointsToAxis;
+        if (enabled == captured) return;
+        captured = enabled;
+        captureStarted = NSProcessInfo.processInfo.systemUptime;
+        motion.reset({warp.x, warp.y});
+    }
+    if (!enabled && mouseButtons.any()) {
+        for (unsigned button = 0; button < mouseButtons.size(); ++button) {
+            if (mouseButtons[button]) SRDMSendMouseButton(button, false);
+        }
+        mouseButtons.reset();
+    }
 }

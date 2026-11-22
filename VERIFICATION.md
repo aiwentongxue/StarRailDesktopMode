@@ -9,8 +9,8 @@
 | arm64 Mac Catalyst 构建与签名 | 通过 |
 | 配置匹配、视口坐标、回中状态、合并位移单测 | 通过 |
 | 新 dylib 单独加载并进入游戏世界 | 通过。仅加载本插件，关闭 PlayCover 键盘映射。日志显示 `desktop_layout=1`，世界界面出现 `V`、`Enter`、队伍 `1`–`4`、`E` 和鼠标图标 |
-| 原生桌面输入 | 用户确认短按 W、长按 W 加 A 或 Shift、松开部分或全部按键均正常。`M` 能打开地图，`Esc` 能返回并打开手机菜单，鼠标能点击图像设定。地图拖拽、战斗、文本输入、手柄和高回报率待验收 |
-| 加载本机光标 PNG | 运行日志确认 `custom_arrow=1`。实际箭头替换待验收 |
+| 原生桌面输入 | 用户确认短按 W、长按 W 加 A 或 Shift、松开部分或全部按键均正常。长按 W 加右键可以冲刺。`M` 能打开地图，`Esc` 能返回并打开手机菜单，鼠标能点击图像设定。窗口自动化测试中地图未响应拖动，战斗、文本输入、手柄和高回报率待验收 |
+| 加载本机光标 PNG | 运行日志确认 `custom_arrow=1`。用户确认在视口内移动时保持游戏箭头样式 |
 | 探索到地图的光标回中 | 用户在窗口模式按 `M` 打开地图后确认回到画面中心。两点误差阈值、连续切换、全屏、副屏及游戏指针同步待验收 |
 
 ## WASD 对照
@@ -27,7 +27,11 @@ PlayCover 键盘映射关闭，固定约 30 FPS。完整独立插件和仅启用
 
 游戏探索时请求隐藏和锁定指针，打开地图时请求显示并解锁。宿主优先在前台游戏窗口用 Quartz 同步隐藏并捕获指针，失败时请求 Catalyst 指针锁定。镜头只在捕获成功时接收位移。菜单和失焦会释放捕获并清除累计位移。[Apple Quartz 相对指针](https://developer.apple.com/documentation/coregraphics/cgassociatemouseandmousecursorposition(_:)) · [Apple Catalyst 指针锁定](https://developer.apple.com/documentation/uikit/uiviewcontroller/preferspointerlocked?language=objc)
 
+重新锁定把物理指针固定在游戏视口中心。用户在窗口模式复测，将指针移出游戏窗口后松开 Option，随后呼出能回中，点击继续由游戏接收。按住 Option 在视口内移动时，用户确认游戏箭头样式稳定。显示时已在中心两点以内便直接释放指针，需要定位时在定位后恢复关联。用户确认呼出后的首段移动流畅。[GenshinDesktopMode 光标实现](https://github.com/cnSniperMike/GenshinDesktopMode/blob/b0fe5fc6f51b80d4c7a1141b3284732c76d6bd57/genshin/pointer_bridge.h) · [SDL 的 Cocoa 指针定位](https://github.com/libsdl-org/SDL/blob/main/src/video/cocoa/SDL_cocoamouse.m#L548-L571)
+
 独立输入测试中，国服客户端从 `mouse x`、`mouse y` 读取镜头位移。日志记录了 AppKit 位移累加、Unity 帧计数以及菜单和失焦时释放捕获。用户确认光标隐藏时可以直接转动镜头，横向和纵向方向正常。基础镜头增益调为初版的 2.5 倍，继续使用 PlayCover 灵敏度。用户复测确认速度合适，松开 Option 后指针立即隐藏并恢复转向。
+
+重新锁定时从首个相对移动事件扣除视口回中位移。捕获期间鼠标按钮的按下和松开送入原生 Unity 输入，释放捕获时松开仍被桥接持有的按钮。用户复测把指针移至视口边缘，再松开 Option 并轻移鼠标，镜头平稳。长按 W 时点右键可进入冲刺。
 
 ## 图形设置对照
 

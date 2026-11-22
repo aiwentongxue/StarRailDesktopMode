@@ -122,10 +122,22 @@ void SetGamePointerLock(UIViewController *controller, bool locked) {
     [controller setNeedsUpdateOfPrefersPointerLocked];
 }
 
-bool SetQuartzPointerCapture(bool enabled) {
-    using Associate = CGError (*)(boolean_t);
+using WarpPointer = CGError (*)(CGPoint);
+using AssociatePointer = CGError (*)(boolean_t);
+
+WarpPointer QuartzWarp() {
+    static const auto warp = reinterpret_cast<WarpPointer>(dlsym(RTLD_DEFAULT, "CGWarpMouseCursorPosition"));
+    return warp;
+}
+
+AssociatePointer QuartzAssociation() {
+    static const auto associate = reinterpret_cast<AssociatePointer>(dlsym(RTLD_DEFAULT, "CGAssociateMouseAndMouseCursorPosition"));
+    return associate;
+}
+
+bool SetQuartzPointerCapture(bool enabled, Point anchor = {}) {
     using ChangeVisibility = CGError (*)(CGDirectDisplayID);
-    static const auto associate = reinterpret_cast<Associate>(dlsym(RTLD_DEFAULT, "CGAssociateMouseAndMouseCursorPosition"));
+    const auto associate = QuartzAssociation();
     static const auto hide = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayHideCursor"));
     static const auto show = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayShowCursor"));
     if (!associate || !hide || !show) return false;
@@ -135,8 +147,12 @@ bool SetQuartzPointerCapture(bool enabled) {
         show(kCGNullDirectDisplay);
         return false;
     }
-    if (associate(false) != kCGErrorSuccess) return false;
-    if (hide(kCGNullDirectDisplay) == kCGErrorSuccess) return true;
+    const auto warp = QuartzWarp();
+    if (!warp || associate(false) != kCGErrorSuccess) return false;
+    if (hide(kCGNullDirectDisplay) == kCGErrorSuccess) {
+        if (warp(CGPointMake(anchor.x, anchor.y)) == kCGErrorSuccess) return true;
+        show(kCGNullDirectDisplay);
+    }
     associate(true);
     return false;
 }
@@ -151,7 +167,7 @@ id Arrow() {
 }
 
 void SetCursorInGame(id cursor, SEL selector) {
-    if (NSThread.isMainThread && ownsVisibleArrow && cursor == Arrow()) cursor = customCursor;
+    if (NSThread.isMainThread && ownsVisibleArrow) cursor = customCursor;
     originalSetCursor(cursor, selector);
 }
 
@@ -182,7 +198,7 @@ void RefreshCursor(bool owns) {
     if (!customCursor || !originalSetCursor) return;
     ownsVisibleArrow = owns;
     id currentCursor = Send(NSClassFromString(@"NSCursor"), "currentCursor");
-    if (owns && currentCursor == Arrow()) {
+    if (owns && currentCursor != customCursor) {
         originalSetCursor(customCursor, sel_registerName("set"));
     } else if (!owns && currentCursor == customCursor) {
         originalSetCursor(Arrow(), sel_registerName("set"));
@@ -250,6 +266,8 @@ bool SRDMGameAcceptsKeyboard() {
     __weak UIView *_lastView;
     __weak UIViewController *_lockController;
     __weak id _mouseTrackingWindow;
+    __weak id _cursorRectWindow;
+    id _cursorEventMonitor;
     BOOL _initialMouseMovedEvents;
     bool _quartzPointerCaptured;
     bool _attemptedQuartzCapture;
@@ -292,8 +310,7 @@ bool SRDMGameAcceptsKeyboard() {
         _gain = CameraGain();
         customCursor = LoadCursor();
         if (customCursor) {
-            Method setter = class_getInstanceMethod(NSClassFromString(@"NSCursor"), sel_registerName("set"));
-            if (setter) originalSetCursor = reinterpret_cast<SetCursor>(method_setImplementation(setter, (IMP)SetCursorInGame));
+            [self installCursorTracking];
         }
         NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
         [center addObserver:self selector:@selector(pointerLockChanged:)
@@ -326,20 +343,50 @@ bool SRDMGameAcceptsKeyboard() {
     SetGamePointerLock(_lockController, false);
     _lockController = nil;
     SRDMSetCameraMouseCapture(false, _gain);
-    [self updateQuartzCapture:false];
+    [self updateQuartzCapture:false anchor:starrail::Point{}];
     [self setMouseTrackingWindow:nil];
     SRDMReleaseKeyboard();
     RefreshCursor(false);
+    [self setGameCursorRectWindow:nil];
 }
 
-- (void)updateQuartzCapture:(bool)requested {
+- (bool)updateQuartzCapture:(bool)requested anchor:(starrail::Point)anchor {
     if (!requested) {
         if (_quartzPointerCaptured) _quartzPointerCaptured = SetQuartzPointerCapture(false);
         _attemptedQuartzCapture = false;
     } else if (!_attemptedQuartzCapture) {
         _attemptedQuartzCapture = true;
-        _quartzPointerCaptured = SetQuartzPointerCapture(true);
+        _quartzPointerCaptured = SetQuartzPointerCapture(true, anchor);
         if (_diagnosticsEnabled) NSLog(@"[StarRailDesktopMode] Quartz pointer capture=%d", _quartzPointerCaptured);
+        return _quartzPointerCaptured;
+    }
+    return false;
+}
+
+- (void)installCursorTracking {
+    Method setter = class_getInstanceMethod(NSClassFromString(@"NSCursor"), sel_registerName("set"));
+    if (!setter) return;
+    originalSetCursor = reinterpret_cast<SetCursor>(method_setImplementation(setter, (IMP)SetCursorInGame));
+    Class events = NSClassFromString(@"NSEvent");
+    const SEL addMonitor = sel_registerName("addLocalMonitorForEventsMatchingMask:handler:");
+    if (![events respondsToSelector:addMonitor]) return;
+    constexpr uint64_t CursorUpdateEvents = 1ULL << 17; // NSEventMaskCursorUpdate
+    __weak SRDMPlayCoverHost *host = self;
+    id (^handle)(id) = ^id(id event) {
+        [host updatePointer];
+        return ownsVisibleArrow ? nil : event;
+    };
+    _cursorEventMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(
+        events, addMonitor, CursorUpdateEvents, handle);
+}
+
+- (void)setGameCursorRectWindow:(id)window {
+    if (window == _cursorRectWindow) return;
+    Send<void>(_cursorRectWindow, "enableCursorRects");
+    _cursorRectWindow = nil;
+    if (Send<BOOL>(window, "areCursorRectsEnabled")) {
+        Send<void>(window, "disableCursorRects");
+        _cursorRectWindow = window;
     }
 }
 
@@ -387,7 +434,7 @@ bool SRDMGameAcceptsKeyboard() {
     }
 
     static auto cursorVisible = reinterpret_cast<boolean_t (*)()>(dlsym(RTLD_DEFAULT, "CGCursorIsVisible"));
-    static auto warp = reinterpret_cast<CGError (*)(CGPoint)>(dlsym(RTLD_DEFAULT, "CGWarpMouseCursorPosition"));
+    const auto warp = QuartzWarp();
     UIViewController *controller = gameOwns ? view.window.rootViewController : nil;
     if (_lockController != controller) {
         SetGamePointerLock(_lockController, false);
@@ -396,13 +443,15 @@ bool SRDMGameAcceptsKeyboard() {
     const auto requested = SRDMRequestedCursor();
     const bool needsLock = gameOwns && requested.known && !requested.visible &&
                            requested.locked && !_playToolsCursorHidden;
-    [self updateQuartzCapture:needsLock];
+    const CGPoint before = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
+    const starrail::Point from{before.x, primaryTop - before.y};
+    const auto center = viewport.center();
+    const bool warped = [self updateQuartzCapture:needsLock anchor:center];
     SetGamePointerLock(_lockController, needsLock && !_quartzPointerCaptured);
     const bool locked = _quartzPointerCaptured || view.window.windowScene.pointerLockState.isLocked;
     const bool systemVisible = !cursorVisible || cursorVisible() != 0;
     const bool visible = !locked && !_playToolsCursorHidden && systemVisible && (!requested.known || requested.visible);
-    const CGPoint mousePosition = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
-    starrail::Point mouse{mousePosition.x, primaryTop - mousePosition.y};
+    starrail::Point mouse = warped ? center : from;
 
     if (_lastView != view) {
         _pointer.update(false, true);
@@ -413,19 +462,27 @@ bool SRDMGameAcceptsKeyboard() {
     const bool shouldCenter = _pointer.update(gameOwns && (visible || needsLock || locked || _playToolsCursorHidden || pointerInside), visible);
     const bool cameraCapture = needsLock && locked;
     [self setMouseTrackingWindow:cameraCapture ? window : nil];
-    SRDMSetCameraMouseCapture(cameraCapture, _gain);
+    const CGPoint warpDelta = warped ? CGPointMake(center.x - from.x, from.y - center.y) : CGPointZero;
+    SRDMSetCameraMouseCapture(cameraCapture, _gain, warpDelta);
     if (shouldCenter && warp) {
         const auto spot = viewport.center();
-        if (warp(CGPointMake(spot.x, spot.y)) == kCGErrorSuccess) {
+        const bool alreadyCentered = std::hypot(mouse.x - spot.x, mouse.y - spot.y) <= 2;
+        if (!alreadyCentered && warp(CGPointMake(spot.x, spot.y)) == kCGErrorSuccess) {
+            // Reassociate after a visible warp to resume hardware motion
+            // immediately, as in SDL's Cocoa warp implementation.
+            if (const auto associate = QuartzAssociation()) associate(true);
             mouse = spot;
-            if (_diagnosticsEnabled) {
-                const CGPoint actual = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
-                NSLog(@"[StarRailDesktopMode] pointer centered error=(%.2f,%.2f) pt",
-                      actual.x - spot.x, primaryTop - actual.y - spot.y);
-            }
+        }
+        if (_diagnosticsEnabled) {
+            const CGPoint actual = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
+            NSLog(@"[StarRailDesktopMode] pointer centered error=(%.2f,%.2f) pt",
+                  actual.x - spot.x, primaryTop - actual.y - spot.y);
         }
     }
-    RefreshCursor(gameOwns && visible && GameReceivesPointerAt(view, viewport, mouse));
+    const bool gameCursor = gameOwns && visible && viewport.contains(mouse) && customCursor && originalSetCursor;
+    if (gameCursor) [self setGameCursorRectWindow:window];
+    RefreshCursor(gameCursor);
+    if (!gameCursor) [self setGameCursorRectWindow:nil];
 
     if (_diagnosticsEnabled && gameOwns && !_loggedViewport) {
         _loggedViewport = true;

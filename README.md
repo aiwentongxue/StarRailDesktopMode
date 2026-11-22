@@ -2,7 +2,7 @@
 
 《崩坏：星穹铁道》在 PlayCover 上的桌面输入兼容性预览。当前客户端配置为国服 iOS 4.7.0 build 1，运行时核对 Bundle ID 和 UnityFramework UUID。适配以独立 Mac Catalyst dylib 交付。
 
-当前源码在国服 iOS 4.7.0 build 1 启用游戏自带的 PC 键鼠布局。真机已验证短按与组合键移动、隐藏光标时转动镜头、松开 Option 后立即重新锁定，以及打开地图时光标回到视口中心。游戏菜单会保存渲染精度，`0.6 / 0.8 / 1.0` 的主 3D 渲染尺寸尚未通过验收。具体结果见 [真机验证](VERIFICATION.md)。
+当前源码在国服 iOS 4.7.0 build 1 启用游戏自带的 PC 键鼠布局。真机已验证短按与组合键移动、右键冲刺、隐藏光标时转动镜头、Option 呼出和重新锁定，以及打开地图时光标回到视口中心。游戏菜单会保存渲染精度，`0.6 / 0.8 / 1.0` 的主 3D 渲染尺寸尚未通过验收。具体结果见 [真机验证](VERIFICATION.md)。
 
 ## 构建
 
@@ -39,6 +39,6 @@ log stream --style compact --predicate 'process == "hkrpg" AND eventMessage CONT
 
 ## 实现参考
 
-客户端适配核对国服构建标识和原生输入入口，再启用游戏的桌面布局。宿主通过 UIKit 和 AppKit 读取视口和指针锁状态。键盘桥接按实际按下和松开事件更新 Unity，每个键独立维护。鼠标桥接在探索时累加相对位移，按 Unity 帧为两个鼠标轴提供同一份位移。镜头增益沿用 PlayCover 的灵敏度。图形探针记录已保存的设置和渲染尺寸。
+客户端适配核对国服构建标识和原生输入入口，再启用游戏的桌面布局。宿主通过 UIKit 和 AppKit 读取视口和指针锁状态。桥接用实际的按下和松开事件更新 Unity 的键盘与鼠标按钮。探索时按 Unity 帧合并相对位移，并从首个鼠标事件扣除重新锁定时的定位位移。镜头增益沿用 PlayCover 的灵敏度。图形探针记录已保存的设置和渲染尺寸。
 
 视口与光标做法参考 MIT 授权的 GenshinDesktopMode。插件由 PlayCover 的用户插件机制加载。[GenshinDesktopMode](https://github.com/cnSniperMike/GenshinDesktopMode) · [PlayCover 用户插件管理](https://github.com/PlayCover/PlayCover/blob/24bbed7/PlayCover/Utils/PlayTools.swift)

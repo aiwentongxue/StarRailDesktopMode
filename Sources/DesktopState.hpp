@@ -104,7 +104,12 @@ private:
 
 class FrameMotion {
 public:
-    void add(double x, double y) { pending_.add(x, y); }
+    void add(double x, double y) {
+        if (!std::isfinite(x) || !std::isfinite(y)) return;
+        // AppKit can include a programmatic warp in its next motion packet.
+        pending_.add(x - warp_.x, y - warp_.y);
+        warp_ = {};
+    }
 
     Point sample(uint32_t frame, double gain) {
         if (!sampled_ || frame != frame_) {
@@ -115,15 +120,17 @@ public:
         return value_;
     }
 
-    void reset() {
+    void reset(Point warp = {}) {
         pending_ = {};
         value_ = {};
         sampled_ = false;
+        warp_ = warp;
     }
 
 private:
     RelativeMotion pending_;
     Point value_;
+    Point warp_;
     uint32_t frame_ = 0;
     bool sampled_ = false;
 };
