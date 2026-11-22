@@ -10,7 +10,7 @@ StarRailDesktopMode 在 PlayCover 里启用《崩坏：星穹铁道》iOS 客户
 2. 打开 PlayCover 的游戏设置，进入插件列表。备份并移除原有的 PC 模式插件或同名预览插件，再导入新版 dylib。
 3. 关闭 PlayCover 的「鍵盤映射」，然后启动游戏。在 macOS「控制台」按 `StarRailDesktopMode` 过滤，`desktop_layout=1` 表示 PC 布局已启用。
 
-可选的自定义光标使用本机的 64×64 PNG。将图片命名为 `cursor.png`，放到以下路径并重启游戏。箭头以 32 点显示，热点按参考图箭尖设在 (8, 3) 点。图片缺失或无效时使用系统箭头。
+从 `v0.1.1` 开始，Release 的 dylib 已内置游戏箭头。要替换箭头，将自己的 64×64 PNG 命名为 `cursor.png`，放到以下路径并重启游戏。箭头以 32 点显示，热点按参考图箭尖设在 (8, 3) 点。插件依次使用有效的本机图片、构建时内置的图片和系统箭头。
 
 ```text
 ~/Library/Containers/com.miHoYo.hkrpg/Data/Library/Application Support/StarRailDesktopMode/cursor.png
@@ -37,6 +37,12 @@ StarRailDesktopMode 在 PlayCover 里启用《崩坏：星穹铁道》iOS 客户
 ```
 
 生成物为 `.build/libStarRailDesktopMode.dylib`。脚本会为产物签名并检查签名。构建所需文件均随源码提供。
+
+如需在本机生成带默认箭头的单文件插件，构建时传入你的 64×64 PNG。图片会直接写入 dylib，导入时只需选择该 dylib。
+
+```sh
+SRDM_CURSOR_PNG="/path/to/cursor.png" ./Scripts/build.sh .build/embedded-cursor
+```
 
 ## 图形诊断
 

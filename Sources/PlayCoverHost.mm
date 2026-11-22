@@ -14,6 +14,10 @@
 
 namespace {
 
+#ifdef SRDM_EMBED_CURSOR
+#include "SRDMEmbeddedCursor.hpp"
+#endif
+
 using starrail::Point;
 using starrail::Rect;
 
@@ -171,12 +175,11 @@ void SetCursorInGame(id cursor, SEL selector) {
     originalSetCursor(cursor, selector);
 }
 
-id LoadCursor() {
-    NSURL *resource = [SRDMApplicationSupport() URLByAppendingPathComponent:@"cursor.png"];
-    if (!resource) return nil;
-    NSNumber *size = nil;
-    if (![resource getResourceValue:&size forKey:NSURLFileSizeKey error:nil] || size.unsignedIntegerValue > 1024 * 1024) return nil;
-    CGImageSourceRef imageSource = CGImageSourceCreateWithURL((__bridge CFURLRef)resource, nullptr);
+constexpr NSUInteger MaxCursorBytes = 1024 * 1024;
+
+id CursorFromPNG(NSData *png) {
+    if (!png.length || png.length > MaxCursorBytes) return nil;
+    CGImageSourceRef imageSource = CGImageSourceCreateWithData((__bridge CFDataRef)png, nullptr);
     if (!imageSource) return nil;
     CFDictionaryRef properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nullptr);
     NSDictionary *metadata = CFBridgingRelease(properties);
@@ -184,21 +187,40 @@ id LoadCursor() {
                  [(__bridge NSString *)CGImageSourceGetType(imageSource) isEqualToString:@"public.png"] &&
                  [metadata[(__bridge NSString *)kCGImagePropertyPixelWidth] intValue] == 64 &&
                  [metadata[(__bridge NSString *)kCGImagePropertyPixelHeight] intValue] == 64;
+    CGImageRef raster = valid ? CGImageSourceCreateImageAtIndex(imageSource, 0, nullptr) : nullptr;
     CFRelease(imageSource);
-    if (!valid) return nil;
+    if (!raster) return nil;
 
-    id image = Send(Send(NSClassFromString(@"NSImage"), "alloc"), "initWithContentsOfURL:", resource);
+    id image = Send(Send(NSClassFromString(@"NSImage"), "alloc"), "initWithCGImage:size:", raster, CGSizeMake(32, 32));
+    CGImageRelease(raster);
     if (!image) return nil;
-    Send<void>(image, "setSize:", CGSizeMake(32, 32));
     // The reference arrow tip is at (16, 6) in the 2× raster.
     return Send(Send(NSClassFromString(@"NSCursor"), "alloc"), "initWithImage:hotSpot:", image, CGPointMake(8, 3));
 }
 
-void RefreshCursor(bool owns) {
+id LoadCursor() {
+    NSURL *resource = [SRDMApplicationSupport() URLByAppendingPathComponent:@"cursor.png"];
+    NSNumber *size = nil;
+    if ([resource getResourceValue:&size forKey:NSURLFileSizeKey error:nil] && size.unsignedIntegerValue <= MaxCursorBytes) {
+        if (id cursor = CursorFromPNG([NSData dataWithContentsOfURL:resource])) {
+            NSLog(@"[StarRailDesktopMode] cursor source=file");
+            return cursor;
+        }
+    }
+#ifdef SRDM_EMBED_CURSOR
+    if (id cursor = CursorFromPNG([NSData dataWithBytes:EmbeddedCursorPNG length:sizeof(EmbeddedCursorPNG)])) {
+        NSLog(@"[StarRailDesktopMode] cursor source=embedded");
+        return cursor;
+    }
+#endif
+    return nil;
+}
+
+void RefreshCursor(bool owns, bool reapply = false) {
     if (!customCursor || !originalSetCursor) return;
     ownsVisibleArrow = owns;
     id currentCursor = Send(NSClassFromString(@"NSCursor"), "currentCursor");
-    if (owns && currentCursor != customCursor) {
+    if (owns && (reapply || currentCursor != customCursor)) {
         originalSetCursor(customCursor, sel_registerName("set"));
     } else if (!owns && currentCursor == customCursor) {
         originalSetCursor(Arrow(), sel_registerName("set"));
@@ -268,6 +290,8 @@ bool SRDMGameAcceptsKeyboard() {
     __weak id _mouseTrackingWindow;
     __weak id _cursorRectWindow;
     id _cursorEventMonitor;
+    starrail::Point _visibleArrowLocation;
+    bool _visibleArrowMoved;
     BOOL _initialMouseMovedEvents;
     bool _quartzPointerCaptured;
     bool _attemptedQuartzCapture;
@@ -319,6 +343,8 @@ bool SRDMGameAcceptsKeyboard() {
                       name:@"SRDMUnityCursorChanged" object:nil];
         [center addObserver:self selector:@selector(pointerLockChanged:)
                       name:@"NSWindowDidBecomeKeyNotification" object:nil];
+        [center addObserver:self selector:@selector(pointerLockChanged:)
+                      name:@"NSApplicationDidBecomeActiveNotification" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillHide:)
                       name:@"playtools.cursorWillHide" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillShow:)
@@ -381,9 +407,10 @@ bool SRDMGameAcceptsKeyboard() {
 }
 
 - (void)setGameCursorRectWindow:(id)window {
-    if (window == _cursorRectWindow) return;
-    Send<void>(_cursorRectWindow, "enableCursorRects");
-    _cursorRectWindow = nil;
+    if (window != _cursorRectWindow) {
+        Send<void>(_cursorRectWindow, "enableCursorRects");
+        _cursorRectWindow = nil;
+    }
     if (Send<BOOL>(window, "areCursorRectsEnabled")) {
         Send<void>(window, "disableCursorRects");
         _cursorRectWindow = window;
@@ -481,7 +508,13 @@ bool SRDMGameAcceptsKeyboard() {
     }
     const bool gameCursor = gameOwns && visible && viewport.contains(mouse) && customCursor && originalSetCursor;
     if (gameCursor) [self setGameCursorRectWindow:window];
-    RefreshCursor(gameCursor);
+    // AppKit can reset the visible shape during motion without changing
+    // NSCursor.currentCursor. Reapply it through the first stationary frame.
+    const bool arrowMoved = gameCursor && ownsVisibleArrow &&
+                            (mouse.x != _visibleArrowLocation.x || mouse.y != _visibleArrowLocation.y);
+    RefreshCursor(gameCursor, !ownsVisibleArrow || arrowMoved || _visibleArrowMoved);
+    _visibleArrowLocation = mouse;
+    _visibleArrowMoved = arrowMoved;
     if (!gameCursor) [self setGameCursorRectWindow:nil];
 
     if (_diagnosticsEnabled && gameOwns && !_loggedViewport) {
