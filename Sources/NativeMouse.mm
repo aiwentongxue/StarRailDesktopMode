@@ -2,6 +2,7 @@
 #import <objc/message.h>
 
 #include "DesktopState.hpp"
+#include "UnityCodeHooks.hpp"
 #include <array>
 #include <bitset>
 #include <cstring>
@@ -10,18 +11,33 @@
 
 namespace {
 
-// CN 4.7.0 build 1 dispatches Input.GetAxis and Input.GetAxisRaw here.
-constexpr uintptr_t AxisTable = 0x1656e038;
-constexpr uintptr_t GetAxisTarget = 0x100c6724;
-constexpr uintptr_t GetAxisRawTarget = 0x100c68a4;
-constexpr uintptr_t MousePresentSlot = 0x1656e0e0;
-constexpr uintptr_t MousePresentTarget = 0x100c7900;
-constexpr uintptr_t ScrollDeltaSlot = 0x1656e180;
-constexpr uintptr_t ScrollDeltaTarget = 0x100c76bc;
-constexpr uintptr_t FrameCountWrapper = 0x0f145a20;
-constexpr uintptr_t FrameCountSlot = 0x165729f0;
-constexpr uintptr_t FrameCountTarget = 0x107d5750;
-constexpr std::array<uint32_t, 4> FrameCountWords{0x9003a148, 0x910ac108, 0xf96ba100, 0xd61f0000};
+struct InputDelegates {
+    uintptr_t axisTable;
+    uintptr_t axis;
+    uintptr_t rawAxis;
+    uintptr_t presenceSlot;
+    uintptr_t presence;
+    uintptr_t positionSlot;
+    uintptr_t position;
+    uintptr_t scrollSlot;
+    uintptr_t scroll;
+    uintptr_t frameCountWrapper;
+    uintptr_t frameCountSlot;
+    uintptr_t frameCount;
+    std::array<uint32_t, 4> frameCountWords;
+};
+
+constexpr InputDelegates MainlandInput{
+    0x1656e038, 0x100c6724, 0x100c68a4, 0x1656e0e0, 0x100c7900,
+    0x1656e178, 0x100c75fc, 0x1656e180, 0x100c76bc,
+    0x0f145a20, 0x165729f0, 0x107d5750, {0x9003a148, 0x910ac108, 0xf96ba100, 0xd61f0000}
+};
+
+constexpr InputDelegates InternationalInput{
+    0x1664cca0, 0x100c6b54, 0x100c6cd4, 0x1664cd48, 0x100c7d30,
+    0x1664cde0, 0x100c7a2c, 0x1664cde8, 0x100c7aec,
+    0x0f144a78, 0x166526a8, 0x107d5b80, {0xf003a828, 0x913c6108, 0xf973c900, 0xd61f0000}
+};
 
 struct UnityString {
     uintptr_t type;
@@ -37,6 +53,9 @@ AxisGetter originalAxis;
 AxisGetter originalRawAxis;
 FrameGetter frameCount;
 VectorGetter originalScroll;
+VectorGetter originalPosition;
+bool radialPositionEnabled;
+CGPoint radialPosition;
 id mouseMonitor;
 
 std::mutex motionLock;
@@ -88,6 +107,19 @@ float GetAxisRaw(const UnityString *name) { return ReadAxis(name, originalRawAxi
 
 bool GetMousePresent() {
     return true;
+}
+
+void GetMousePosition(float *output) {
+    {
+        std::lock_guard lock(motionLock);
+        if (radialPositionEnabled) {
+            output[0] = static_cast<float>(radialPosition.x);
+            output[1] = static_cast<float>(radialPosition.y);
+            output[2] = 0;
+            return;
+        }
+    }
+    originalPosition(output);
 }
 
 void GetScrollDelta(float *output) {
@@ -142,31 +174,29 @@ id ReceiveEvent(id event) {
     return nil;
 }
 
-bool Contains(const section_64 *section, uintptr_t offset, size_t size) {
-    return section && section->size >= size && offset >= section->addr &&
-           offset - section->addr <= section->size - size;
-}
-
 } // namespace
 
-bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
+bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide, const starrail::ClientProfile &client,
+                     bool &radialPositionInstalled) {
+    using starrail::SectionContains;
+    radialPositionInstalled = false;
+    const auto &delegates = client.region == starrail::ClientRegion::international ? InternationalInput : MainlandInput;
     const auto *text = SRDMFindSection(image, "__TEXT", "__text");
     const auto *data = SRDMFindSection(image, "__DATA", "__common");
-    if (!Contains(text, FrameCountWrapper, sizeof(FrameCountWords)) ||
-        !Contains(data, AxisTable, 2 * sizeof(uintptr_t)) ||
-        !Contains(data, MousePresentSlot, sizeof(uintptr_t)) ||
-        !Contains(data, ScrollDeltaSlot, sizeof(uintptr_t)) ||
-        !Contains(data, FrameCountSlot, sizeof(uintptr_t)) ||
-        std::memcmp(reinterpret_cast<const void *>(slide + FrameCountWrapper),
-                    FrameCountWords.data(), sizeof(FrameCountWords)) != 0) return false;
-    auto *axes = reinterpret_cast<uintptr_t *>(slide + AxisTable);
-    auto *presence = reinterpret_cast<uintptr_t *>(slide + MousePresentSlot);
-    auto *wheel = reinterpret_cast<uintptr_t *>(slide + ScrollDeltaSlot);
-    const auto frameTarget = *reinterpret_cast<const uintptr_t *>(slide + FrameCountSlot);
-    if (axes[0] != slide + GetAxisTarget || axes[1] != slide + GetAxisRawTarget ||
-        *presence != slide + MousePresentTarget ||
-        *wheel != slide + ScrollDeltaTarget ||
-        frameTarget != slide + FrameCountTarget) return false;
+    if (!SectionContains(text, delegates.frameCountWrapper, sizeof(delegates.frameCountWords)) ||
+        !SectionContains(data, delegates.axisTable, 2 * sizeof(uintptr_t)) ||
+        !SectionContains(data, delegates.presenceSlot, sizeof(uintptr_t)) ||
+        !SectionContains(data, delegates.scrollSlot, sizeof(uintptr_t)) ||
+        !SectionContains(data, delegates.frameCountSlot, sizeof(uintptr_t)) ||
+        std::memcmp(reinterpret_cast<const void *>(slide + delegates.frameCountWrapper),
+                    delegates.frameCountWords.data(), sizeof(delegates.frameCountWords)) != 0) return false;
+    auto *axes = reinterpret_cast<uintptr_t *>(slide + delegates.axisTable);
+    auto *presence = reinterpret_cast<uintptr_t *>(slide + delegates.presenceSlot);
+    auto *wheel = reinterpret_cast<uintptr_t *>(slide + delegates.scrollSlot);
+    const auto frameTarget = *reinterpret_cast<const uintptr_t *>(slide + delegates.frameCountSlot);
+    if (axes[0] != slide + delegates.axis || axes[1] != slide + delegates.rawAxis ||
+        *presence != slide + delegates.presence || *wheel != slide + delegates.scroll ||
+        frameTarget != slide + delegates.frameCount) return false;
 
     Class events = NSClassFromString(@"NSEvent");
     const SEL addMonitor = sel_registerName("addLocalMonitorForEventsMatchingMask:handler:");
@@ -188,6 +218,15 @@ bool SRDMInstallMouse(const mach_header_64 &image, intptr_t slide) {
     __atomic_store_n(axes + 1, reinterpret_cast<uintptr_t>(GetAxisRaw), __ATOMIC_RELEASE);
     __atomic_store_n(presence, reinterpret_cast<uintptr_t>(GetMousePresent), __ATOMIC_RELEASE);
     __atomic_store_n(wheel, reinterpret_cast<uintptr_t>(GetScrollDelta), __ATOMIC_RELEASE);
+    if (SectionContains(data, delegates.positionSlot, sizeof(uintptr_t)) &&
+        SectionContains(text, delegates.position, sizeof(uint32_t))) {
+        auto *position = reinterpret_cast<uintptr_t *>(slide + delegates.positionSlot);
+        if (*position == slide + delegates.position) {
+            originalPosition = reinterpret_cast<VectorGetter>(*position);
+            __atomic_store_n(position, reinterpret_cast<uintptr_t>(GetMousePosition), __ATOMIC_RELEASE);
+            radialPositionInstalled = true;
+        }
+    }
     return true;
 }
 
@@ -208,4 +247,11 @@ void SRDMSetCameraMouseCapture(bool enabled, double sensitivity, CGPoint warp) {
         }
         mouseButtons.reset();
     }
+}
+
+void SRDMSetRadialPosition(bool enabled, CGPoint pixels) {
+    if (!originalPosition) return;
+    std::lock_guard lock(motionLock);
+    radialPositionEnabled = enabled;
+    radialPosition = pixels;
 }

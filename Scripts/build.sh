@@ -38,6 +38,7 @@ xcrun --sdk macosx clang++ -dynamiclib -std=c++20 -O2 -fobjc-arc \
     -F"$sdk/System/iOSSupport/System/Library/Frameworks" \
     -framework Foundation -framework UIKit -framework QuartzCore \
     -framework CoreGraphics -framework GameController -framework Metal -framework ImageIO \
+    -weak_framework MetalFX \
     -Wall -Wextra -Werror -fvisibility=hidden \
     -install_name '@rpath/libStarRailDesktopMode.dylib' \
     "${cursor_flags[@]}" "$project_dir"/Sources/*.mm -o "$plugin"

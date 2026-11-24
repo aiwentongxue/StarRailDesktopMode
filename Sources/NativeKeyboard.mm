@@ -15,11 +15,12 @@ Result Send(id object, const char *selector, Args... args) {
         object, sel_registerName(selector), args...);
 }
 
-// HSR CN 4.7.0 build 1: UnityView.handleCommand: and processKeyboard
+// UnityView.handleCommand: and processKeyboard
 // use this native input function for both key-down and key-up. The original
 // command path infers releases from a timeout because UIKeyCommand is not
 // an edge-based keyboard API.
-constexpr uintptr_t KeyEventOffset = 0x10ba2a98;
+constexpr uintptr_t MainlandKeyEvent = 0x10ba2a98;
+constexpr uintptr_t InternationalKeyEvent = 0x10ba2f80;
 constexpr uintptr_t KeyCommandsOffset = 0x6c28;
 constexpr std::array<uint32_t, 4> KeyEventPrologue{0xa9be4ff4, 0xa9017bfd, 0x910043fd, 0xaa0103f4};
 using KeyEvent = void (*)(int, int);
@@ -83,11 +84,12 @@ id ReceiveEvent(id event) {
 
 } // namespace
 
-bool SRDMInstallKeyboard(const mach_header_64 &image, intptr_t slide) {
+bool SRDMInstallKeyboard(const mach_header_64 &image, intptr_t slide, const starrail::ClientProfile &client) {
+    const uintptr_t keyEvent = client.region == starrail::ClientRegion::international ? InternationalKeyEvent : MainlandKeyEvent;
     const auto *text = SRDMFindSection(image, "__TEXT", "__text");
-    if (!text || text->size < sizeof(KeyEventPrologue) || KeyEventOffset < text->addr ||
-        KeyEventOffset - text->addr > text->size - sizeof(KeyEventPrologue)) return false;
-    const auto *code = reinterpret_cast<const uint32_t *>(slide + KeyEventOffset);
+    if (!text || text->size < sizeof(KeyEventPrologue) || keyEvent < text->addr ||
+        keyEvent - text->addr > text->size - sizeof(KeyEventPrologue)) return false;
+    const auto *code = reinterpret_cast<const uint32_t *>(slide + keyEvent);
     if (std::memcmp(code, KeyEventPrologue.data(), sizeof(KeyEventPrologue)) != 0) return false;
 
     Method keyCommands = class_getInstanceMethod(NSClassFromString(@"UnityView"), sel_registerName("keyCommands"));
@@ -97,7 +99,7 @@ bool SRDMInstallKeyboard(const mach_header_64 &image, intptr_t slide) {
         ![events respondsToSelector:addMonitor]) return false;
 
     constexpr uint64_t KeyboardEvents = (1ULL << 10) | (1ULL << 11) | (1ULL << 12);
-    sendUnityKey = reinterpret_cast<KeyEvent>(slide + KeyEventOffset);
+    sendUnityKey = reinterpret_cast<KeyEvent>(slide + keyEvent);
     originalKeyCommands = reinterpret_cast<KeyCommands>(method_getImplementation(keyCommands));
     id (^handle)(id) = ^id(id event) { return ReceiveEvent(event); };
     eventMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(

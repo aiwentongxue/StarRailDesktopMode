@@ -1,3 +1,4 @@
+#include "ClientProfile.hpp"
 #include "DesktopState.hpp"
 #include "KeyboardState.hpp"
 
@@ -10,14 +11,16 @@
 int main() {
     using namespace starrail;
 
-    const auto &profile = China470;
-    assert(Matches(profile, profile.bundleID, "4.7.0", "1", profile.unityUUID));
-    assert(!Matches(profile, "com.HoYoverse.hkrpgoversea", "4.7.0", "1", profile.unityUUID));
-    assert(!Matches(profile, profile.bundleID, "4.7.1", "1", profile.unityUUID));
-    assert(!Matches(profile, profile.bundleID, "4.7.0", "2", profile.unityUUID));
-    auto uuid = profile.unityUUID;
-    ++uuid.back();
-    assert(!Matches(profile, profile.bundleID, "4.7.0", "1", uuid));
+    for (const auto *profile : SupportedClients) {
+        assert(FindClient(profile->bundleID, "4.7.0", "1", profile->unityUUID) == profile);
+        assert(!FindClient(profile->bundleID, "4.7.1", "1", profile->unityUUID));
+        assert(!FindClient(profile->bundleID, "4.7.0", "2", profile->unityUUID));
+        auto uuid = profile->unityUUID;
+        ++uuid.back();
+        assert(!FindClient(profile->bundleID, "4.7.0", "1", uuid));
+    }
+    assert(!FindClient(International470.bundleID, "4.7.0", "1", China470.unityUUID));
+    assert(!FindClient(China470.bundleID, "4.7.0", "1", International470.unityUUID));
 
     const auto desktop = QuartzRect({-1920, 1200, 1600, 900}, 1080);
     assert(desktop.x == -1920 && desktop.y == -1020);

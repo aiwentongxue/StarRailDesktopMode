@@ -1,32 +1,10 @@
 #pragma once
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
-#include <string_view>
 
 namespace starrail {
-
-struct ClientProfile {
-    std::string_view bundleID;
-    std::string_view version;
-    std::string_view build;
-    std::array<uint8_t, 16> unityUUID;
-};
-
-inline constexpr ClientProfile China470{
-    "com.miHoYo.hkrpg", "4.7.0", "1",
-    {0x26, 0x4C, 0x6E, 0x79, 0x85, 0xC7, 0x30, 0x8E,
-     0xB9, 0xF9, 0xCC, 0x36, 0xEF, 0x18, 0xAC, 0xBB}
-};
-
-inline bool Matches(const ClientProfile &profile, std::string_view bundleID,
-                    std::string_view version, std::string_view build,
-                    const std::array<uint8_t, 16> &uuid) {
-    return bundleID == profile.bundleID && version == profile.version &&
-           build == profile.build && uuid == profile.unityUUID;
-}
 
 struct Point {
     double x = 0;

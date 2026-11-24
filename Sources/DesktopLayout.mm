@@ -20,9 +20,9 @@ constexpr uint32_t TrueInResultRegister = 0x52800020; // mov w0, #1
 constexpr uint32_t FalseInResultRegister = 0x52800000; // mov w0, #0
 constexpr uint32_t NoOperation = 0xd503201f; // nop
 
-// CN 4.7.0 build 1. Enable the desktop input path and presentation at
+// Enable the desktop input path and presentation at
 // their call sites, preserving the game's platform value.
-constexpr std::array LayoutChanges{
+constexpr std::array MainlandLayout{
     InstructionChange{0x01d355a8, 0x97cf61d9, 0x37000160, TrueInResultRegister},
     InstructionChange{0x01d3576c, 0x97cf6168, 0x37000160, TrueInResultRegister},
     InstructionChange{0x0253eb60, 0x97af3c6b, 0x360000a0, TrueInResultRegister},
@@ -32,9 +32,17 @@ constexpr std::array LayoutChanges{
     InstructionChange{0x019e13c0, 0x3900c41f, 0xa9427bfd, NoOperation},
 };
 
+constexpr std::array InternationalLayout{
+    InstructionChange{0x01d39b50, 0x97cf5ca5, 0x37000160, TrueInResultRegister},
+    InstructionChange{0x01d39d14, 0x97cf5c34, 0x37000160, TrueInResultRegister},
+    InstructionChange{0x02543b38, 0x97af34ab, 0x360000a0, TrueInResultRegister},
+    InstructionChange{0x019e56a4, 0x3900c01f, 0x958cd44f, NoOperation},
+    InstructionChange{0x019e56b0, 0x3900c41f, 0xa9427bfd, NoOperation},
+};
+
 // These call sites skip the game cursor lifecycle on mobile. Keep the
 // keyboard/mouse and controller checks after each predicate intact.
-constexpr std::array CursorChanges{
+constexpr std::array MainlandCursor{
     InstructionChange{0x01d91ec4, 0x97cdef6a, 0x37000180, FalseInResultRegister},
     InstructionChange{0x01d91fc4, 0x97cdef2a, 0x37000240, FalseInResultRegister},
     InstructionChange{0x01d92164, 0x97cdeec2, 0x37000160, FalseInResultRegister},
@@ -42,10 +50,22 @@ constexpr std::array CursorChanges{
     InstructionChange{0x01d924c0, 0x97cdedeb, 0x36000060, FalseInResultRegister},
 };
 
+constexpr std::array InternationalCursor{
+    InstructionChange{0x01d9646c, 0x97cdea36, 0x37000180, FalseInResultRegister},
+    InstructionChange{0x01d9656c, 0x97cde9f6, 0x37000240, FalseInResultRegister},
+    InstructionChange{0x01d9670c, 0x97cde98e, 0x37000160, FalseInResultRegister},
+    InstructionChange{0x01d967ac, 0x97cde966, 0x370004e0, FalseInResultRegister},
+    InstructionChange{0x01d96a68, 0x97cde8b7, 0x36000060, FalseInResultRegister},
+};
+
 // The managed Cursor methods dispatch through Unity's writable delegate table.
-constexpr uintptr_t UnityCursorTable = 0x1656f118;
-constexpr uintptr_t CursorVisibilityDelegate = 0x107c02e4;
-constexpr uintptr_t CursorLockDelegate = 0x107c032c;
+struct CursorDelegates {
+    uintptr_t table;
+    uintptr_t visibility;
+    uintptr_t lock;
+};
+constexpr CursorDelegates MainlandDelegates{0x1656f118, 0x107c02e4, 0x107c032c};
+constexpr CursorDelegates InternationalDelegates{0x1664dd80, 0x107c0714, 0x107c075c};
 using CursorSetter = void (*)(int);
 CursorSetter originalCursorVisibility;
 CursorSetter originalCursorLock;
@@ -157,18 +177,21 @@ bool ApplyChanges(const mach_header_64 &verifiedImage, intptr_t slide,
 
 } // namespace
 
-bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide) {
-    return ApplyChanges(verifiedImage, slide, LayoutChanges);
+bool SRDMEnableDesktopLayout(const mach_header_64 &verifiedImage, intptr_t slide, const starrail::ClientProfile &client) {
+    const auto &changes = client.region == starrail::ClientRegion::international ? InternationalLayout : MainlandLayout;
+    return ApplyChanges(verifiedImage, slide, changes);
 }
 
-bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide) {
+bool SRDMEnableDesktopCursor(const mach_header_64 &verifiedImage, intptr_t slide, const starrail::ClientProfile &client) {
+    const bool international = client.region == starrail::ClientRegion::international;
+    const auto &delegates = international ? InternationalDelegates : MainlandDelegates;
     const auto *data = SRDMFindSection(verifiedImage, "__DATA", "__common");
     constexpr size_t tableSize = 4 * sizeof(uintptr_t);
-    if (!data || data->size < tableSize || UnityCursorTable < data->addr ||
-        UnityCursorTable - data->addr > data->size - tableSize) return false;
-    auto *slots = reinterpret_cast<uintptr_t *>(slide + UnityCursorTable);
-    if (slots[1] != slide + CursorVisibilityDelegate || slots[3] != slide + CursorLockDelegate) return false;
-    if (!ApplyChanges(verifiedImage, slide, CursorChanges)) return false;
+    if (!data || data->size < tableSize || delegates.table < data->addr ||
+        delegates.table - data->addr > data->size - tableSize) return false;
+    auto *slots = reinterpret_cast<uintptr_t *>(slide + delegates.table);
+    if (slots[1] != slide + delegates.visibility || slots[3] != slide + delegates.lock) return false;
+    if (!ApplyChanges(verifiedImage, slide, international ? InternationalCursor : MainlandCursor)) return false;
     originalCursorVisibility = reinterpret_cast<CursorSetter>(slots[1]);
     originalCursorLock = reinterpret_cast<CursorSetter>(slots[3]);
     __atomic_store_n(slots + 1, reinterpret_cast<uintptr_t>(ObserveCursorVisibility), __ATOMIC_RELEASE);

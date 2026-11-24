@@ -20,6 +20,8 @@ namespace {
 
 using starrail::Point;
 using starrail::Rect;
+bool regionSwitchDialogOpen;
+NSUInteger menuTrackingDepth;
 
 template<class Result = id, class... Args>
 Result Send(id object, const char *selector, Args... args) {
@@ -39,7 +41,15 @@ id MacApplication() {
     return Send(NSClassFromString(@"NSApplication"), "sharedApplication");
 }
 
+id GameInputWindow() {
+    id app = MacApplication();
+    if (menuTrackingDepth || regionSwitchDialogOpen || !Send<BOOL>(app, "isActive") ||
+        Send(app, "modalWindow")) return nil;
+    return Send(app, "keyWindow");
+}
+
 double CameraGain() {
+    if (NSProcessInfo.processInfo.environment[@"POMPOMIA_MODE"]) return 1;
     NSString *usersLibrary = [NSHomeDirectoryForUser(NSUserName()) stringByAppendingPathComponent:@"Library"];
     NSString *manager = [NSBundle.mainBundle objectForInfoDictionaryKey:@"SRDMPlayCoverManager"];
     if (![manager isEqualToString:@"com.iven.playcover.custom"]) manager = @"io.playcover.PlayCover";
@@ -128,6 +138,7 @@ void SetGamePointerLock(UIViewController *controller, bool locked) {
 
 using WarpPointer = CGError (*)(CGPoint);
 using AssociatePointer = CGError (*)(boolean_t);
+using ChangeVisibility = CGError (*)(CGDirectDisplayID);
 
 WarpPointer QuartzWarp() {
     static const auto warp = reinterpret_cast<WarpPointer>(dlsym(RTLD_DEFAULT, "CGWarpMouseCursorPosition"));
@@ -139,11 +150,16 @@ AssociatePointer QuartzAssociation() {
     return associate;
 }
 
-bool SetQuartzPointerCapture(bool enabled, Point anchor = {}) {
-    using ChangeVisibility = CGError (*)(CGDirectDisplayID);
-    const auto associate = QuartzAssociation();
+ChangeVisibility QuartzCursorVisibility(bool visible) {
     static const auto hide = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayHideCursor"));
     static const auto show = reinterpret_cast<ChangeVisibility>(dlsym(RTLD_DEFAULT, "CGDisplayShowCursor"));
+    return visible ? show : hide;
+}
+
+bool SetQuartzPointerCapture(bool enabled, Point anchor = {}) {
+    const auto associate = QuartzAssociation();
+    const auto hide = QuartzCursorVisibility(false);
+    const auto show = QuartzCursorVisibility(true);
     if (!associate || !hide || !show) return false;
 
     if (!enabled) {
@@ -165,6 +181,9 @@ using SetCursor = void (*)(id, SEL);
 SetCursor originalSetCursor;
 bool ownsVisibleArrow;
 id customCursor;
+UIImage *customCursorArtwork;
+constexpr double CursorSize = 32;
+constexpr CGPoint CursorHotSpot{8, 3};
 
 id Arrow() {
     return Send(NSClassFromString(@"NSCursor"), "arrowCursor");
@@ -191,11 +210,13 @@ id CursorFromPNG(NSData *png) {
     CFRelease(imageSource);
     if (!raster) return nil;
 
-    id image = Send(Send(NSClassFromString(@"NSImage"), "alloc"), "initWithCGImage:size:", raster, CGSizeMake(32, 32));
+    id image = Send(Send(NSClassFromString(@"NSImage"), "alloc"), "initWithCGImage:size:", raster,
+                    CGSizeMake(CursorSize, CursorSize));
+    if (image) customCursorArtwork = [UIImage imageWithCGImage:raster scale:2 orientation:UIImageOrientationUp];
     CGImageRelease(raster);
     if (!image) return nil;
     // The reference arrow tip is at (16, 6) in the 2× raster.
-    return Send(Send(NSClassFromString(@"NSCursor"), "alloc"), "initWithImage:hotSpot:", image, CGPointMake(8, 3));
+    return Send(Send(NSClassFromString(@"NSCursor"), "alloc"), "initWithImage:hotSpot:", image, CursorHotSpot);
 }
 
 id LoadCursor() {
@@ -230,6 +251,7 @@ void RefreshCursor(bool owns, bool reapply = false) {
 struct UnityImage {
     const mach_header_64 *header = nullptr;
     intptr_t slide = 0;
+    const starrail::ClientProfile *client = nullptr;
 };
 
 UnityImage FindVerifiedUnityImage() {
@@ -248,10 +270,10 @@ UnityImage FindVerifiedUnityImage() {
                 std::array<uint8_t, 16> uuid{};
                 std::memcpy(uuid.data(), reinterpret_cast<const uuid_command *>(item)->uuid, uuid.size());
                 NSBundle *bundle = NSBundle.mainBundle;
-                if (starrail::Matches(starrail::China470, bundle.bundleIdentifier.UTF8String,
+                if (const auto *profile = starrail::FindClient(bundle.bundleIdentifier.UTF8String ?: "",
                     [[bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] UTF8String] ?: "",
                     [[bundle objectForInfoDictionaryKey:@"CFBundleVersion"] UTF8String] ?: "", uuid)) {
-                    return {header, _dyld_get_image_vmaddr_slide(i)};
+                    return {header, _dyld_get_image_vmaddr_slide(i), profile};
                 }
                 return {};
             }
@@ -270,16 +292,19 @@ NSURL *SRDMApplicationSupport(void) {
     return [base URLByAppendingPathComponent:@"StarRailDesktopMode" isDirectory:YES];
 }
 
+CGSize SRDMGameDrawableSize() {
+    if (!NSThread.isMainThread) return CGSizeZero;
+    return ((CAMetalLayer *)ForegroundMetalView().layer).drawableSize;
+}
+
 bool SRDMGameAcceptsKeyboard() {
-    id app = MacApplication();
-    if (!Send<BOOL>(app, "isActive")) return false;
-    id window = Send(app, "keyWindow");
+    id window = GameInputWindow();
     return Send<BOOL>(window, "isKeyWindow") && !Send<BOOL>(window, "isSheet") &&
            !IsEditing(window) && ForegroundMetalView();
 }
 
 @interface SRDMPlayCoverHost : NSObject
-- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide;
+- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide client:(const starrail::ClientProfile *)client;
 - (void)frame:(CADisplayLink *)displayLink;
 @end
 
@@ -289,6 +314,10 @@ bool SRDMGameAcceptsKeyboard() {
     __weak UIViewController *_lockController;
     __weak id _mouseTrackingWindow;
     __weak id _cursorRectWindow;
+    UIImageView *_cursorOverlay;
+    bool _useCursorOverlay;
+    bool _cursorHiddenForOverlay;
+    bool _loggedCursorOverlay;
     id _cursorEventMonitor;
     starrail::Point _visibleArrowLocation;
     bool _visibleArrowMoved;
@@ -302,9 +331,13 @@ bool SRDMGameAcceptsKeyboard() {
     bool _loggedHostContext;
     bool _playToolsCursorHidden;
     bool _desktopLayout;
+    bool _radialPositionInstalled;
+    bool _radialHeld;
+    double _radialReleaseUntil;
 }
 
-- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide {
+- (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide client:(const starrail::ClientProfile *)client {
+    _useCursorOverlay = NSProcessInfo.processInfo.environment[@"POMPOMIA_MODE"] != nil;
     NSURL *support = SRDMApplicationSupport();
     auto hasMarker = ^bool(NSString *name) {
         NSString *path = [support URLByAppendingPathComponent:name].path;
@@ -315,21 +348,30 @@ bool SRDMGameAcceptsKeyboard() {
     if (_diagnosticsEnabled) SRDMStartDiagnostics();
 
     if (!_diagnosticsOnly) {
+        if (_useCursorOverlay) {
+            NSLog(@"[StarRailDesktopMode] login version label=%d", SRDMInstallLoginVersionLabel(*header, slide, *client));
+        }
+        NSURL *research = [[NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:@"UserPlugins"]
+                           URLByAppendingPathComponent:@"libSRDMCaptureResearch.dylib"];
+        if (!hasMarker(@"graphics-disabled") && ![NSFileManager.defaultManager fileExistsAtPath:research.path]) {
+            NSLog(@"[StarRailDesktopMode] graphics settings=%d", SRDMInstallGraphicsSettings(*header, slide, *client));
+        }
         NSURL *legacy = [[NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:@"UserPlugins"]
                          URLByAppendingPathComponent:@"libUnityDesktopMode.dylib"];
         if (legacy && [NSFileManager.defaultManager fileExistsAtPath:legacy.path]) {
             NSLog(@"[StarRailDesktopMode] remove the legacy desktop-mode plugin before enabling input");
             return;
         }
-        _desktopLayout = SRDMEnableDesktopLayout(*header, slide);
+        _desktopLayout = SRDMEnableDesktopLayout(*header, slide, *client);
     }
     if (_desktopLayout) {
         // Unity fills its native delegate table during player initialization.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-            const bool enabled = SRDMEnableDesktopCursor(*header, slide);
+            const bool enabled = SRDMEnableDesktopCursor(*header, slide, *client);
             NSLog(@"[StarRailDesktopMode] game cursor lifecycle=%d", enabled);
-            NSLog(@"[StarRailDesktopMode] native keyboard=%d", SRDMInstallKeyboard(*header, slide));
-            NSLog(@"[StarRailDesktopMode] native mouse axes=%d", SRDMInstallMouse(*header, slide));
+            NSLog(@"[StarRailDesktopMode] native keyboard=%d", SRDMInstallKeyboard(*header, slide, *client));
+            const bool mouse = SRDMInstallMouse(*header, slide, *client, _radialPositionInstalled);
+            NSLog(@"[StarRailDesktopMode] native mouse axes=%d radial position=%d", mouse, _radialPositionInstalled);
         });
         _gain = CameraGain();
         customCursor = LoadCursor();
@@ -345,6 +387,12 @@ bool SRDMGameAcceptsKeyboard() {
                       name:@"NSWindowDidBecomeKeyNotification" object:nil];
         [center addObserver:self selector:@selector(pointerLockChanged:)
                       name:@"NSApplicationDidBecomeActiveNotification" object:nil];
+        [center addObserver:self selector:@selector(regionSwitchDialogChanged:)
+                      name:@"com.iven.pompomia.regionSwitchDialogChanged" object:nil];
+        [center addObserver:self selector:@selector(menuDidBeginTracking:)
+                      name:@"NSMenuDidBeginTrackingNotification" object:nil];
+        [center addObserver:self selector:@selector(menuDidEndTracking:)
+                      name:@"NSMenuDidEndTrackingNotification" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillHide:)
                       name:@"playtools.cursorWillHide" object:nil];
         [center addObserver:self selector:@selector(playToolsCursorWillShow:)
@@ -359,12 +407,15 @@ bool SRDMGameAcceptsKeyboard() {
     CADisplayLink *displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(frame:)];
     displayLink.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
     [displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    NSLog(@"[StarRailDesktopMode] host ready client=CN-4.7.0 diagnostic_only=%d desktop_layout=%d custom_arrow=%d",
-          _diagnosticsOnly, _desktopLayout, customCursor != nil);
+    NSLog(@"[StarRailDesktopMode] host ready client=%s %s diagnostic_only=%d desktop_layout=%d custom_arrow=%d",
+          client->bundleID.data(), client->version.data(), _diagnosticsOnly, _desktopLayout, customCursor != nil);
 }
 
 - (void)lostFocus:(NSNotification *)notification {
     (void)notification;
+    _radialHeld = false;
+    _radialReleaseUntil = 0;
+    SRDMSetRadialPosition(false, CGPointZero);
     _pointer.update(false, true);
     SetGamePointerLock(_lockController, false);
     _lockController = nil;
@@ -373,6 +424,7 @@ bool SRDMGameAcceptsKeyboard() {
     [self setMouseTrackingWindow:nil];
     SRDMReleaseKeyboard();
     RefreshCursor(false);
+    [self hideCursorOverlay];
     [self setGameCursorRectWindow:nil];
 }
 
@@ -393,17 +445,57 @@ bool SRDMGameAcceptsKeyboard() {
     Method setter = class_getInstanceMethod(NSClassFromString(@"NSCursor"), sel_registerName("set"));
     if (!setter) return;
     originalSetCursor = reinterpret_cast<SetCursor>(method_setImplementation(setter, (IMP)SetCursorInGame));
+    __weak SRDMPlayCoverHost *host = self;
     Class events = NSClassFromString(@"NSEvent");
     const SEL addMonitor = sel_registerName("addLocalMonitorForEventsMatchingMask:handler:");
     if (![events respondsToSelector:addMonitor]) return;
     constexpr uint64_t CursorUpdateEvents = 1ULL << 17; // NSEventMaskCursorUpdate
-    __weak SRDMPlayCoverHost *host = self;
     id (^handle)(id) = ^id(id event) {
-        [host updatePointer];
+        SRDMPlayCoverHost *owner = host;
+        if (!owner) return event;
+        [owner updatePointer];
         return ownsVisibleArrow ? nil : event;
     };
     _cursorEventMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(
         events, addMonitor, CursorUpdateEvents, handle);
+}
+
+- (void)hideCursorOverlay {
+    _cursorOverlay.hidden = YES;
+    if (_cursorHiddenForOverlay && QuartzCursorVisibility(true)(kCGNullDirectDisplay) == kCGErrorSuccess) {
+        _cursorHiddenForOverlay = false;
+    }
+}
+
+- (bool)showCursorOverlayInView:(UIView *)view viewport:(starrail::Rect)viewport location:(starrail::Point)mouse {
+    UIWindow *window = view.window;
+    if (!window || !customCursorArtwork) return false;
+    const CGRect bounds = view.bounds;
+    const double scaleX = bounds.size.width / viewport.width;
+    const double scaleY = bounds.size.height / viewport.height;
+    const CGRect local = CGRectMake(bounds.origin.x + (mouse.x - viewport.x - CursorHotSpot.x) * scaleX,
+                                    bounds.origin.y + (mouse.y - viewport.y - CursorHotSpot.y) * scaleY,
+                                    CursorSize * scaleX, CursorSize * scaleY);
+    const CGRect frame = [view convertRect:local toView:window];
+    if (!_cursorHiddenForOverlay) {
+        const auto hide = QuartzCursorVisibility(false);
+        if (!hide || !QuartzCursorVisibility(true) || hide(kCGNullDirectDisplay) != kCGErrorSuccess) return false;
+        _cursorHiddenForOverlay = true;
+    }
+    if (!_cursorOverlay) {
+        _cursorOverlay = [[UIImageView alloc] initWithImage:customCursorArtwork];
+        _cursorOverlay.userInteractionEnabled = NO;
+        _cursorOverlay.isAccessibilityElement = NO;
+    }
+    if (!CGRectEqualToRect(_cursorOverlay.frame, frame)) _cursorOverlay.frame = frame;
+    if (_cursorOverlay.superview != window) [window addSubview:_cursorOverlay];
+    if (window.subviews.lastObject != _cursorOverlay) [window bringSubviewToFront:_cursorOverlay];
+    _cursorOverlay.hidden = NO;
+    if (!_loggedCursorOverlay) {
+        NSLog(@"[StarRailDesktopMode] cursor presentation=overlay");
+        _loggedCursorOverlay = true;
+    }
+    return true;
 }
 
 - (void)setGameCursorRectWindow:(id)window {
@@ -442,11 +534,26 @@ bool SRDMGameAcceptsKeyboard() {
     [self updatePointer];
 }
 
+- (void)regionSwitchDialogChanged:(NSNotification *)notification {
+    regionSwitchDialogOpen = [notification.object boolValue];
+    [self updatePointer];
+}
+
+- (void)menuDidBeginTracking:(NSNotification *)notification {
+    (void)notification;
+    ++menuTrackingDepth;
+    [self updatePointer];
+}
+
+- (void)menuDidEndTracking:(NSNotification *)notification {
+    (void)notification;
+    // Let the selected menu action run before the next frame can capture the mouse again.
+    if (menuTrackingDepth) --menuTrackingDepth;
+}
+
 - (void)updatePointer {
-    id app = MacApplication();
-    id window = Send(app, "keyWindow");
-    const bool appActive = Send<BOOL>(app, "isActive");
-    UIView *view = appActive ? ForegroundMetalView() : nil;
+    id window = GameInputWindow();
+    UIView *view = window ? ForegroundMetalView() : nil;
     NSArray *screens = Send(NSClassFromString(@"NSScreen"), "screens");
     const CGRect primaryScreen = Send<CGRect>(screens.firstObject, "frame");
     const double primaryTop = CGRectGetMaxY(primaryScreen);
@@ -468,16 +575,36 @@ bool SRDMGameAcceptsKeyboard() {
         _lockController = controller;
     }
     const auto requested = SRDMRequestedCursor();
-    const bool needsLock = gameOwns && requested.known && !requested.visible &&
-                           requested.locked && !_playToolsCursorHidden;
+    const bool needsGameLock = gameOwns && requested.known && !requested.visible &&
+                               requested.locked && !_playToolsCursorHidden;
+    using KeyState = bool (*)(uint32_t, uint16_t);
+    static const auto keyDown = reinterpret_cast<KeyState>(dlsym(RTLD_DEFAULT, "CGEventSourceKeyState"));
+    const double now = NSProcessInfo.processInfo.systemUptime;
+    const bool tabHeld = _radialPositionInstalled && gameOwns && keyDown && keyDown(0, 48);
+    const bool radialHeld = tabHeld && (_radialHeld || needsGameLock);
+    if (_radialHeld != radialHeld) {
+        // Keep the selection coordinate available when Unity processes Tab up.
+        if (_diagnosticsEnabled) {
+            NSLog(@"[StarRailDesktopMode] radial held=%d, unity visible=%d, locked=%d",
+                  radialHeld, requested.visible, requested.locked);
+        }
+        _radialReleaseUntil = gameOwns && !radialHeld ? now + 0.05 : 0;
+    }
+    _radialHeld = radialHeld;
+    if (!gameOwns) _radialReleaseUntil = 0;
+    const bool needsLock = needsGameLock && !radialHeld;
+    if (!gameOwns || needsLock || _playToolsCursorHidden || (requested.known && !requested.visible)) {
+        [self hideCursorOverlay];
+    }
     const CGPoint before = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
     const starrail::Point from{before.x, primaryTop - before.y};
     const auto center = viewport.center();
     const bool warped = [self updateQuartzCapture:needsLock anchor:center];
     SetGamePointerLock(_lockController, needsLock && !_quartzPointerCaptured);
     const bool locked = _quartzPointerCaptured || view.window.windowScene.pointerLockState.isLocked;
-    const bool systemVisible = !cursorVisible || cursorVisible() != 0;
-    const bool visible = !locked && !_playToolsCursorHidden && systemVisible && (!requested.known || requested.visible);
+    const bool systemVisible = _cursorHiddenForOverlay || !cursorVisible || cursorVisible() != 0;
+    const bool visible = !locked && !_playToolsCursorHidden &&
+                         (radialHeld || (systemVisible && (!requested.known || requested.visible)));
     starrail::Point mouse = warped ? center : from;
 
     if (_lastView != view) {
@@ -488,6 +615,7 @@ bool SRDMGameAcceptsKeyboard() {
     const bool pointerInside = gameOwns && GameReceivesPointerAt(view, viewport, mouse);
     const bool shouldCenter = _pointer.update(gameOwns && (visible || needsLock || locked || _playToolsCursorHidden || pointerInside), visible);
     const bool cameraCapture = needsLock && locked;
+    const bool canShowArrow = gameOwns && visible && customCursor;
     [self setMouseTrackingWindow:cameraCapture ? window : nil];
     const CGPoint warpDelta = warped ? CGPointMake(center.x - from.x, from.y - center.y) : CGPointZero;
     SRDMSetCameraMouseCapture(cameraCapture, _gain, warpDelta);
@@ -506,16 +634,31 @@ bool SRDMGameAcceptsKeyboard() {
                   actual.x - spot.x, primaryTop - actual.y - spot.y);
         }
     }
-    const bool gameCursor = gameOwns && visible && viewport.contains(mouse) && customCursor && originalSetCursor;
-    if (gameCursor) [self setGameCursorRectWindow:window];
+    const bool radialPosition = gameOwns && (radialHeld || now < _radialReleaseUntil);
+    // Unity expects drawable pixels with an origin at the bottom left.
+    const CGSize pixels = radialPosition ? ((CAMetalLayer *)view.layer).drawableSize : CGSizeZero;
+    if (radialPosition && pixels.width > 0 && pixels.height > 0) {
+        SRDMSetRadialPosition(true, CGPointMake(
+            (mouse.x - viewport.x) / viewport.width * pixels.width,
+            (viewport.y + viewport.height - mouse.y) / viewport.height * pixels.height));
+    } else {
+        SRDMSetRadialPosition(false, CGPointZero);
+    }
+    const bool gameCursor = canShowArrow && viewport.contains(mouse);
+    // Use the same pointer location for clicks and the overlay's arrow tip.
+    // The system shape can still change underneath the overlay.
+    const bool overlay = _useCursorOverlay && gameCursor &&
+                         [self showCursorOverlayInView:view viewport:viewport location:mouse];
+    if (!overlay) [self hideCursorOverlay];
+    const bool hardwareArrow = gameCursor && !overlay && originalSetCursor;
+    [self setGameCursorRectWindow:hardwareArrow ? window : nil];
     // AppKit can reset the visible shape during motion without changing
     // NSCursor.currentCursor. Reapply it through the first stationary frame.
-    const bool arrowMoved = gameCursor && ownsVisibleArrow &&
+    const bool arrowMoved = hardwareArrow && ownsVisibleArrow &&
                             (mouse.x != _visibleArrowLocation.x || mouse.y != _visibleArrowLocation.y);
-    RefreshCursor(gameCursor, !ownsVisibleArrow || arrowMoved || _visibleArrowMoved);
+    RefreshCursor(hardwareArrow, !ownsVisibleArrow || arrowMoved || _visibleArrowMoved);
     _visibleArrowLocation = mouse;
     _visibleArrowMoved = arrowMoved;
-    if (!gameCursor) [self setGameCursorRectWindow:nil];
 
     if (_diagnosticsEnabled && gameOwns && !_loggedViewport) {
         _loggedViewport = true;
@@ -526,6 +669,7 @@ bool SRDMGameAcceptsKeyboard() {
 - (void)frame:(CADisplayLink *)displayLink {
     (void)displayLink;
     if (_desktopLayout) [self updatePointer];
+    SRDMUpdateGraphicsSettings();
     if (!_diagnosticsEnabled) return;
     SRDMSampleGraphics((CAMetalLayer *)ForegroundMetalView().layer);
 }
@@ -537,11 +681,11 @@ void Activate() {
     if (attempted) return;
     const auto image = FindVerifiedUnityImage();
     if (!image.header) {
-        NSLog(@"[StarRailDesktopMode] Unity build does not match the CN-4.7.0 profile");
+        NSLog(@"[StarRailDesktopMode] Unity build does not match a supported client profile");
         return;
     }
     attempted = true;
-    [[[SRDMPlayCoverHost alloc] init] startWithImage:image.header slide:image.slide];
+    [[[SRDMPlayCoverHost alloc] init] startWithImage:image.header slide:image.slide client:image.client];
 }
 
 void ImageAdded(const mach_header *header, intptr_t) {
@@ -553,9 +697,12 @@ void ImageAdded(const mach_header *header, intptr_t) {
 
 __attribute__((constructor)) void Initialize() {
     @autoreleasepool {
-        const NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
-        if (![bundleID isEqualToString:@"com.miHoYo.hkrpg"]) return;
-        _dyld_register_func_for_add_image(ImageAdded);
+        const std::string_view bundleID = NSBundle.mainBundle.bundleIdentifier.UTF8String ?: "";
+        for (const auto *profile : starrail::SupportedClients) {
+            if (bundleID != profile->bundleID) continue;
+            _dyld_register_func_for_add_image(ImageAdded);
+            return;
+        }
     }
 }
 } // namespace
