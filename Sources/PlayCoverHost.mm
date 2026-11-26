@@ -181,7 +181,6 @@ using SetCursor = void (*)(id, SEL);
 SetCursor originalSetCursor;
 bool ownsVisibleArrow;
 id customCursor;
-UIImage *customCursorArtwork;
 constexpr double CursorSize = 32;
 constexpr CGPoint CursorHotSpot{8, 3};
 
@@ -212,7 +211,6 @@ id CursorFromPNG(NSData *png) {
 
     id image = Send(Send(NSClassFromString(@"NSImage"), "alloc"), "initWithCGImage:size:", raster,
                     CGSizeMake(CursorSize, CursorSize));
-    if (image) customCursorArtwork = [UIImage imageWithCGImage:raster scale:2 orientation:UIImageOrientationUp];
     CGImageRelease(raster);
     if (!image) return nil;
     // The reference arrow tip is at (16, 6) in the 2× raster.
@@ -314,10 +312,6 @@ bool SRDMGameAcceptsKeyboard() {
     __weak UIViewController *_lockController;
     __weak id _mouseTrackingWindow;
     __weak id _cursorRectWindow;
-    UIImageView *_cursorOverlay;
-    bool _useCursorOverlay;
-    bool _cursorHiddenForOverlay;
-    bool _loggedCursorOverlay;
     id _cursorEventMonitor;
     starrail::Point _visibleArrowLocation;
     bool _visibleArrowMoved;
@@ -337,7 +331,6 @@ bool SRDMGameAcceptsKeyboard() {
 }
 
 - (void)startWithImage:(const mach_header_64 *)header slide:(intptr_t)slide client:(const starrail::ClientProfile *)client {
-    _useCursorOverlay = NSProcessInfo.processInfo.environment[@"POMPOMIA_MODE"] != nil;
     NSURL *support = SRDMApplicationSupport();
     auto hasMarker = ^bool(NSString *name) {
         NSString *path = [support URLByAppendingPathComponent:name].path;
@@ -348,7 +341,7 @@ bool SRDMGameAcceptsKeyboard() {
     if (_diagnosticsEnabled) SRDMStartDiagnostics();
 
     if (!_diagnosticsOnly) {
-        if (_useCursorOverlay) {
+        if (NSProcessInfo.processInfo.environment[@"POMPOMIA_MODE"] != nil) {
             NSLog(@"[StarRailDesktopMode] login version label=%d", SRDMInstallLoginVersionLabel(*header, slide, *client));
         }
         NSURL *research = [[NSBundle.mainBundle.privateFrameworksURL URLByAppendingPathComponent:@"UserPlugins"]
@@ -424,7 +417,6 @@ bool SRDMGameAcceptsKeyboard() {
     [self setMouseTrackingWindow:nil];
     SRDMReleaseKeyboard();
     RefreshCursor(false);
-    [self hideCursorOverlay];
     [self setGameCursorRectWindow:nil];
 }
 
@@ -458,44 +450,6 @@ bool SRDMGameAcceptsKeyboard() {
     };
     _cursorEventMonitor = reinterpret_cast<id (*)(Class, SEL, uint64_t, id)>(objc_msgSend)(
         events, addMonitor, CursorUpdateEvents, handle);
-}
-
-- (void)hideCursorOverlay {
-    _cursorOverlay.hidden = YES;
-    if (_cursorHiddenForOverlay && QuartzCursorVisibility(true)(kCGNullDirectDisplay) == kCGErrorSuccess) {
-        _cursorHiddenForOverlay = false;
-    }
-}
-
-- (bool)showCursorOverlayInView:(UIView *)view viewport:(starrail::Rect)viewport location:(starrail::Point)mouse {
-    UIWindow *window = view.window;
-    if (!window || !customCursorArtwork) return false;
-    const CGRect bounds = view.bounds;
-    const double scaleX = bounds.size.width / viewport.width;
-    const double scaleY = bounds.size.height / viewport.height;
-    const CGRect local = CGRectMake(bounds.origin.x + (mouse.x - viewport.x - CursorHotSpot.x) * scaleX,
-                                    bounds.origin.y + (mouse.y - viewport.y - CursorHotSpot.y) * scaleY,
-                                    CursorSize * scaleX, CursorSize * scaleY);
-    const CGRect frame = [view convertRect:local toView:window];
-    if (!_cursorHiddenForOverlay) {
-        const auto hide = QuartzCursorVisibility(false);
-        if (!hide || !QuartzCursorVisibility(true) || hide(kCGNullDirectDisplay) != kCGErrorSuccess) return false;
-        _cursorHiddenForOverlay = true;
-    }
-    if (!_cursorOverlay) {
-        _cursorOverlay = [[UIImageView alloc] initWithImage:customCursorArtwork];
-        _cursorOverlay.userInteractionEnabled = NO;
-        _cursorOverlay.isAccessibilityElement = NO;
-    }
-    if (!CGRectEqualToRect(_cursorOverlay.frame, frame)) _cursorOverlay.frame = frame;
-    if (_cursorOverlay.superview != window) [window addSubview:_cursorOverlay];
-    if (window.subviews.lastObject != _cursorOverlay) [window bringSubviewToFront:_cursorOverlay];
-    _cursorOverlay.hidden = NO;
-    if (!_loggedCursorOverlay) {
-        NSLog(@"[StarRailDesktopMode] cursor presentation=overlay");
-        _loggedCursorOverlay = true;
-    }
-    return true;
 }
 
 - (void)setGameCursorRectWindow:(id)window {
@@ -593,16 +547,13 @@ bool SRDMGameAcceptsKeyboard() {
     _radialHeld = radialHeld;
     if (!gameOwns) _radialReleaseUntil = 0;
     const bool needsLock = needsGameLock && !radialHeld;
-    if (!gameOwns || needsLock || _playToolsCursorHidden || (requested.known && !requested.visible)) {
-        [self hideCursorOverlay];
-    }
     const CGPoint before = Send<CGPoint>(NSClassFromString(@"NSEvent"), "mouseLocation");
     const starrail::Point from{before.x, primaryTop - before.y};
     const auto center = viewport.center();
     const bool warped = [self updateQuartzCapture:needsLock anchor:center];
     SetGamePointerLock(_lockController, needsLock && !_quartzPointerCaptured);
     const bool locked = _quartzPointerCaptured || view.window.windowScene.pointerLockState.isLocked;
-    const bool systemVisible = _cursorHiddenForOverlay || !cursorVisible || cursorVisible() != 0;
+    const bool systemVisible = !cursorVisible || cursorVisible() != 0;
     const bool visible = !locked && !_playToolsCursorHidden &&
                          (radialHeld || (systemVisible && (!requested.known || requested.visible)));
     starrail::Point mouse = warped ? center : from;
@@ -644,13 +595,7 @@ bool SRDMGameAcceptsKeyboard() {
     } else {
         SRDMSetRadialPosition(false, CGPointZero);
     }
-    const bool gameCursor = canShowArrow && viewport.contains(mouse);
-    // Use the same pointer location for clicks and the overlay's arrow tip.
-    // The system shape can still change underneath the overlay.
-    const bool overlay = _useCursorOverlay && gameCursor &&
-                         [self showCursorOverlayInView:view viewport:viewport location:mouse];
-    if (!overlay) [self hideCursorOverlay];
-    const bool hardwareArrow = gameCursor && !overlay && originalSetCursor;
+    const bool hardwareArrow = canShowArrow && viewport.contains(mouse) && originalSetCursor;
     [self setGameCursorRectWindow:hardwareArrow ? window : nil];
     // AppKit can reset the visible shape during motion without changing
     // NSCursor.currentCursor. Reapply it through the first stationary frame.
