@@ -6,6 +6,7 @@
 #import <objc/runtime.h>
 
 #include "DesktopState.hpp"
+#include "TextInputFocus.hpp"
 #include <array>
 #include <cstring>
 #include <type_traits>
@@ -298,7 +299,7 @@ CGSize SRDMGameDrawableSize() {
 bool SRDMGameAcceptsKeyboard() {
     id window = GameInputWindow();
     return Send<BOOL>(window, "isKeyWindow") && !Send<BOOL>(window, "isSheet") &&
-           !IsEditing(window) && ForegroundMetalView();
+           !IsEditing(window) && !desktop::TextInputFocused() && ForegroundMetalView();
 }
 
 @interface SRDMPlayCoverHost : NSObject
@@ -358,6 +359,7 @@ bool SRDMGameAcceptsKeyboard() {
         _desktopLayout = SRDMEnableDesktopLayout(*header, slide, *client);
     }
     if (_desktopLayout) {
+        desktop::ObserveTextInputFocus();
         // Unity fills its native delegate table during player initialization.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
             const bool enabled = SRDMEnableDesktopCursor(*header, slide, *client);
@@ -513,7 +515,7 @@ bool SRDMGameAcceptsKeyboard() {
     const double primaryTop = CGRectGetMaxY(primaryScreen);
     const starrail::Rect viewport = screens.count ? ScreenViewport(window, view, primaryTop) : starrail::Rect{};
     const bool gameOwns = viewport.valid() && !IsEditing(window);
-    if (!gameOwns) SRDMReleaseKeyboard();
+    if (!gameOwns || desktop::TextInputFocused()) SRDMReleaseKeyboard();
     if (_diagnosticsEnabled && view && !_loggedHostContext) {
         _loggedHostContext = true;
         NSLog(@"[StarRailDesktopMode] window key=%d scene_view=%.0fx%.0f valid_viewport=%d editing=%d",

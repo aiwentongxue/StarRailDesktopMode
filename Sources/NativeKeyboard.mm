@@ -60,14 +60,14 @@ id ReceiveEvent(id event) {
     constexpr NSUInteger CommandMask = 1UL << 20;
     const auto type = Send<NSUInteger>(event, "type");
     if (type != KeyDown && type != KeyUp && type != FlagsChanged) return event;
-    const auto macKey = Send<uint16_t>(event, "keyCode");
-    const auto key = starrail::UnityKey(macKey);
-    const auto flags = Send<NSUInteger>(event, "modifierFlags");
-
     if (!SRDMGameAcceptsKeyboard()) {
         held.releaseAll(SendKey);
         return event;
     }
+
+    const auto macKey = Send<uint16_t>(event, "keyCode");
+    const auto key = starrail::UnityKey(macKey);
+    const auto flags = Send<NSUInteger>(event, "modifierFlags");
     if (!key || key == 309 || key == 310) return event;
     if (type == FlagsChanged) {
         held.update(key, ModifierDown(macKey, flags), SendKey);
